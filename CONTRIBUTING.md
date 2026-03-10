@@ -130,6 +130,8 @@ For new features:
 We follow standard Go conventions with project-specific guidelines:
 
 - Write idiomatic Go code following [Effective Go](https://golang.org/doc/effective_go.html)
+- Prefer an OpenBSD-style mindset: keep control flow simple, use early returns, avoid compact/clever expressions, and optimize for maintainers reading code at 3AM
+- Keep declarations and assignments explicit when it improves readability (for example, split multi-value inline assignments in non-trivial paths)
 - Use `gofmt` for consistent formatting and `go vet` to catch common errors
 - Follow the single responsibility principle and prefer composition over inheritance
 - Use descriptive variable and function names with proper Go naming conventions

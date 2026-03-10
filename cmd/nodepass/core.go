@@ -129,7 +129,8 @@ func getTLSProtocol(parsedURL *url.URL, logger *logs.Logger) (string, *tls.Confi
 		logger.Info("TLS code-1: RAM cert with TLS 1.3")
 		return "1", tlsConfig
 	case "2":
-		crtFile, keyFile := parsedURL.Query().Get("crt"), parsedURL.Query().Get("key")
+		crtFile := parsedURL.Query().Get("crt")
+		keyFile := parsedURL.Query().Get("key")
 		cert, err := tls.LoadX509KeyPair(crtFile, keyFile)
 		if err != nil {
 			logger.Error("Certificate load failed: %v", err)
@@ -169,7 +170,11 @@ func getTLSProtocol(parsedURL *url.URL, logger *logs.Logger) (string, *tls.Confi
 }
 
 func newCommandLine(args []string) *commandLine {
-	return &commandLine{args: args}
+	cmd := &commandLine{
+		args: args,
+	}
+
+	return cmd
 }
 
 func (c *commandLine) parse() (*url.URL, error) {

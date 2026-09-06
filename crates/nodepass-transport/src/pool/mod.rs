@@ -119,4 +119,67 @@ mod tests {
         server_ctrl.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
     }
+
+    #[tokio::test]
+    async fn test_quic_pool_roundtrip() {
+        use nodepass_core::crypto::{create_mode1_client_tls_config, generate_ephemeral_cert};
+        use std::sync::Arc;
+
+        let (cert, key) = generate_ephemeral_cert().unwrap();
+        let mut rustls_server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        rustls_server_cfg.alpn_protocols = vec![b"np-quic".to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server_cfg).unwrap(),
+        ));
+        let server_endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_pool = QuicPool::new(16);
+        let client_pool = QuicPool::new(16);
+
+        server_pool.start_server(server_endpoint);
+
+        let recorded_fp = Arc::new(parking_lot::Mutex::new(None));
+        let mut client_tls_cfg = create_mode1_client_tls_config(recorded_fp);
+        client_tls_cfg.alpn_protocols = vec![b"np-quic".to_vec()];
+        let quic_client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls_cfg).unwrap(),
+        ));
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(quic_client_config);
+
+        client_pool.start_client(client_endpoint, server_addr, "localhost");
+
+        // In QUIC, a stream is only notified to the server peer when data is sent.
+        // Concurrently get client control and write initial payload to notify the server.
+        let (server_ctrl_res, client_ctrl_res) = tokio::join!(
+            server_pool.outgoing_get("00000000", Duration::from_secs(3)),
+            async {
+                let mut c = client_pool.outgoing_get("00000000", Duration::from_secs(3)).await?;
+                c.write_all(b"quic").await?;
+                Ok::<_, PoolError>(c)
+            }
+        );
+
+        let mut server_ctrl = server_ctrl_res.unwrap();
+        let _client_ctrl = client_ctrl_res.unwrap();
+
+        let mut buf = [0u8; 4];
+        server_ctrl.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"quic");
+
+        // Open and exchange on data stream
+        let (id, mut server_stream) = server_pool.incoming_get(Duration::from_secs(3)).await.unwrap();
+        assert!(!id.is_empty());
+
+        server_stream.write_all(b"hello quic data").await.unwrap();
+        let mut client_stream = client_pool.outgoing_get(&id, Duration::from_secs(3)).await.unwrap();
+
+        let mut buf2 = [0u8; 15];
+        client_stream.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"hello quic data");
+    }
 }

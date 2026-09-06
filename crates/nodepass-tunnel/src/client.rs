@@ -274,7 +274,14 @@ impl TunnelClient {
             "1" => {
                 // QUIC pool
                 let quic_pool = Arc::new(QuicPool::new(cfg.max_pool_capacity));
-                let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+                let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+                let mut client_tls_cfg = create_mode1_client_tls_config(Arc::clone(&recorded_fp));
+                client_tls_cfg.alpn_protocols = vec![b"np-quic".to_vec()];
+                let quic_client_config = quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(client_tls_cfg)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?,
+                ));
+                endpoint.set_default_client_config(quic_client_config);
                 let server_addr = self.dns_cache.resolve(&cfg.tunnel_addr).await?;
                 quic_pool.start_client(endpoint, server_addr, &cfg.server_name);
                 quic_pool

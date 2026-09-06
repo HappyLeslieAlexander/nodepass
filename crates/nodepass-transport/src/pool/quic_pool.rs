@@ -199,33 +199,14 @@ impl TransportPool for QuicPool {
             }
         }
 
-        // Try pre-buffered stream first
-        {
-            let mut rx = self.stream_rx.lock().await;
-            if let Ok(stream) = rx.try_recv() {
+        let mut rx = self.stream_rx.lock().await;
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(stream)) => {
                 self.active_count.fetch_sub(1, Ordering::Relaxed);
-                return Ok(stream);
+                Ok(stream)
             }
-        }
-
-        // Or open stream on QUIC connection
-        let conn_opt = self.quic_conn.lock().await.clone();
-        if let Some(conn) = conn_opt {
-            match tokio::time::timeout(timeout, conn.open_bi()).await {
-                Ok(Ok((send, recv))) => Ok(box_stream(QuinnStream::new(send, recv))),
-                Ok(Err(e)) => Err(PoolError::Other(e.to_string())),
-                Err(_) => Err(PoolError::Timeout),
-            }
-        } else {
-            let mut rx = self.stream_rx.lock().await;
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(stream)) => {
-                    self.active_count.fetch_sub(1, Ordering::Relaxed);
-                    Ok(stream)
-                }
-                Ok(None) => Err(PoolError::Closed),
-                Err(_) => Err(PoolError::Timeout),
-            }
+            Ok(None) => Err(PoolError::Closed),
+            Err(_) => Err(PoolError::Timeout),
         }
     }
 

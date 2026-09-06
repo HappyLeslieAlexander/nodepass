@@ -1,0 +1,29 @@
+[package]
+name = "nodepass-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+nodepass-core = { workspace = true }
+nodepass-transport = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+http = { workspace = true }
+quinn = { workspace = true }

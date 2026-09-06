@@ -95,10 +95,14 @@ impl TunnelConfig {
 
         // TunnelKey derivation
         let tunnel_key = if !url.username().is_empty() {
-            url.username().to_string()
+            percent_encoding::percent_decode_str(url.username())
+                .decode_utf8_lossy()
+                .to_string()
         } else if let Some(pass) = url.password() {
             if !pass.is_empty() {
-                pass.to_string()
+                percent_encoding::percent_decode_str(pass)
+                    .decode_utf8_lossy()
+                    .to_string()
             } else {
                 fnv1a_32_hex(&port.to_string())
             }
@@ -192,6 +196,13 @@ impl TunnelConfig {
         } else {
             host.to_string()
         };
+
+        if server_name.contains('\r') || server_name.contains('\n') {
+            return Err(ConfigError::InvalidParam {
+                param: "sni".to_string(),
+                reason: "server_name cannot contain CR or LF characters".to_string(),
+            });
+        }
 
         // QUIC (type=1) and WebSocket (type=2) require TLS
         if (pool_type == "1" || pool_type == "2") && tls_code == "0" {
@@ -401,5 +412,23 @@ mod tests {
         let url = "client://:secretpass@server.com:10101/10.0.0.1:80";
         let cfg = TunnelConfig::parse(url).unwrap();
         assert_eq!(cfg.tunnel_key, "secretpass");
+    }
+
+    #[test]
+    fn test_sni_crlf_rejected() {
+        let url = "server://0.0.0.0:10101/127.0.0.1:8080?sni=evil.com%0d%0aInjected:header";
+        let result = TunnelConfig::parse(url);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_percent_encoded_credentials() {
+        let url = "client://my%40pass%3Fword:secret%231@server.com:10101/10.0.0.1:80";
+        let cfg = TunnelConfig::parse(url).unwrap();
+        assert_eq!(cfg.tunnel_key, "my@pass?word");
+
+        let url2 = "client://:secret%40pass%3F@server.com:10101/10.0.0.1:80";
+        let cfg2 = TunnelConfig::parse(url2).unwrap();
+        assert_eq!(cfg2.tunnel_key, "secret@pass?");
     }
 }

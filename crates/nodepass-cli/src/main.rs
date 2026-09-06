@@ -39,7 +39,7 @@ enum Commands {
 
 #[derive(Args, Debug, Default)]
 struct ServerArgs {
-    #[arg(short = 'p', long = "password")]
+    #[arg(short = 'p', long = "password", env = "NODEPASS_PASSWORD")]
     password: Option<String>,
     #[arg(short = 'l', long = "listen")]
     tunnel_addr: Option<String>,
@@ -57,7 +57,7 @@ struct ServerArgs {
 
 #[derive(Args, Debug, Default)]
 struct ClientArgs {
-    #[arg(short = 'p', long = "password")]
+    #[arg(short = 'p', long = "password", env = "NODEPASS_PASSWORD")]
     password: Option<String>,
     #[arg(short = 's', long = "server")]
     tunnel_addr: Option<String>,
@@ -75,9 +75,9 @@ struct ClientArgs {
 
 #[derive(Args, Debug, Default)]
 struct MasterArgs {
-    #[arg(short = 'l', long = "listen", default_value = "0.0.0.0:8080")]
+    #[arg(short = 'l', long = "listen", default_value = "127.0.0.1:8080")]
     listen: String,
-    #[arg(short = 'k', long = "key")]
+    #[arg(short = 'k', long = "key", env = "NODEPASS_API_KEY")]
     api_key: Option<String>,
     #[arg(long = "prefix", default_value = "/api/v1")]
     prefix: String,
@@ -99,6 +99,65 @@ fn init_logger(log_level: &str) {
         .try_init();
 }
 
+pub fn build_tunnel_url(
+    scheme: &str,
+    tunnel_addr: &str,
+    target_addr: &str,
+    password: &str,
+    params: &[(&str, &str)],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let dummy = format!("{}://{}", scheme, tunnel_addr);
+    let mut parsed = Url::parse(&dummy)?;
+
+    if !password.is_empty() {
+        parsed
+            .set_username(password)
+            .map_err(|_| "Failed to set username in URL")?;
+    }
+
+    let path = if target_addr.starts_with('/') {
+        target_addr.to_string()
+    } else {
+        format!("/{}", target_addr)
+    };
+    parsed.set_path(&path);
+
+    {
+        let mut query = parsed.query_pairs_mut();
+        query.clear();
+        for (k, v) in params {
+            if !v.is_empty() {
+                query.append_pair(k, v);
+            }
+        }
+    }
+
+    Ok(parsed.to_string())
+}
+
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            stream.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -116,11 +175,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr = s.tunnel_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string());
             let target = s.target_addr.unwrap_or_else(|| "127.0.0.1:80".to_string());
             let pwd = s.password.unwrap_or_default();
-            let url_str = if pwd.is_empty() {
-                format!("server://{}/{}?tls={}&type={}&mode={}", addr, target, s.tls, s.pool, s.mode)
-            } else {
-                format!("server://{}@{}/{}?tls={}&type={}&mode={}", pwd, addr, target, s.tls, s.pool, s.mode)
-            };
+            let url_str = build_tunnel_url(
+                "server",
+                &addr,
+                &target,
+                &pwd,
+                &[
+                    ("tls", &s.tls),
+                    ("type", &s.pool),
+                    ("mode", &s.mode),
+                    ("log", &s.log),
+                ],
+            )?;
             run_url(&url_str).await
         }
         Some(Commands::Client(c)) => {
@@ -128,11 +194,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr = c.tunnel_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());
             let target = c.target_addr.unwrap_or_else(|| "127.0.0.1:80".to_string());
             let pwd = c.password.unwrap_or_default();
-            let url_str = if pwd.is_empty() {
-                format!("client://{}/{}?tls={}&type={}&mode={}", addr, target, c.tls, c.pool, c.mode)
-            } else {
-                format!("client://{}@{}/{}?tls={}&type={}&mode={}", pwd, addr, target, c.tls, c.pool, c.mode)
-            };
+            let url_str = build_tunnel_url(
+                "client",
+                &addr,
+                &target,
+                &pwd,
+                &[
+                    ("tls", &c.tls),
+                    ("type", &c.pool),
+                    ("mode", &c.mode),
+                    ("log", &c.log),
+                ],
+            )?;
             run_url(&url_str).await
         }
         Some(Commands::Master(m)) => {
@@ -161,16 +234,48 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     match parsed_url.scheme() {
         "client" => {
             info!("Starting NodePass client: {}", url_str);
-            let client = TunnelClient::new(config);
-            client.run().await?;
+            let client = Arc::new(TunnelClient::new(config));
+            let client_task = {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.run().await })
+            };
+            tokio::select! {
+                res = client_task => {
+                    match res {
+                        Ok(Ok(())) => {},
+                        Ok(Err(e)) => return Err(e.into()),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                _ = wait_for_shutdown_signal() => {
+                    info!("Shutdown signal received, stopping client...");
+                    client.stop();
+                }
+            }
         }
         "server" => {
             info!("Starting NodePass server: {}", url_str);
-            let server = TunnelServer::new(config);
-            server.run().await?;
+            let server = Arc::new(TunnelServer::new(config));
+            let server_task = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move { server.run().await })
+            };
+            tokio::select! {
+                res = server_task => {
+                    match res {
+                        Ok(Ok(())) => {},
+                        Ok(Err(e)) => return Err(e.into()),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                _ = wait_for_shutdown_signal() => {
+                    info!("Shutdown signal received, stopping server...");
+                    server.stop();
+                }
+            }
         }
         "master" => {
-            let listen = format!("{}:{}", parsed_url.host_str().unwrap_or("0.0.0.0"), parsed_url.port().unwrap_or(8080));
+            let listen = format!("{}:{}", parsed_url.host_str().unwrap_or("127.0.0.1"), parsed_url.port().unwrap_or(8080));
             let prefix = parsed_url.path();
             let prefix = if prefix.is_empty() || prefix == "/" { "/api/v1" } else { prefix };
             let key = parsed_url.password();
@@ -211,9 +316,9 @@ async fn run_master(listen_addr: &str, api_key_opt: Option<&str>, prefix: &str) 
     ));
 
     let state = AppState {
-        instances,
-        process_mgr,
-        state_mgr,
+        instances: Arc::clone(&instances),
+        process_mgr: Arc::clone(&process_mgr),
+        state_mgr: Arc::clone(&state_mgr),
         event_tx,
         mcp_handler,
         api_key,
@@ -227,7 +332,79 @@ async fn run_master(listen_addr: &str, api_key_opt: Option<&str>, prefix: &str) 
 
     let router = create_router(state);
     let listener = TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, router).await?;
+
+    let state_mgr_clone = Arc::clone(&state_mgr);
+    let instances_clone = Arc::clone(&instances);
+    let process_mgr_clone = Arc::clone(&process_mgr);
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown_signal().await;
+            info!("Shutdown signal received, stopping master and instances...");
+            process_mgr_clone.stop_all().await;
+            let _ = state_mgr_clone.save(&instances_clone).await;
+            info!("Master state cleanly saved.");
+        })
+        .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_tunnel_url_escaping() {
+        let url_str = build_tunnel_url(
+            "server",
+            "127.0.0.1:8080",
+            "127.0.0.1:80",
+            "my@pass?mode=1#target",
+            &[("tls", "0"), ("mode", "2")],
+        ).expect("build tunnel url");
+
+        assert!(url_str.starts_with("server://"));
+        assert!(url_str.contains("my%40pass%3Fmode%3D1%23target@127.0.0.1:8080/127.0.0.1:80"));
+        assert!(url_str.contains("mode=2"));
+
+        let cfg = TunnelConfig::parse(&url_str).expect("parse built url");
+        assert_eq!(cfg.tunnel_key, "my@pass?mode=1#target");
+        assert_eq!(cfg.run_mode, "2");
+    }
+
+    #[test]
+    fn test_master_default_listen_address() {
+        let _args = MasterArgs::default();
+        // default value from clap attribute
+        let cli = Cli::try_parse_from(["nodepass", "master"]).expect("parse cli");
+        if let Some(Commands::Master(m)) = cli.command {
+            assert_eq!(m.listen, "127.0.0.1:8080");
+        } else {
+            panic!("expected master command");
+        }
+    }
+
+    #[test]
+    fn test_env_credentials() {
+        std::env::set_var("NODEPASS_PASSWORD", "env_secret_123");
+        std::env::set_var("NODEPASS_API_KEY", "env_key_456");
+
+        let cli_server = Cli::try_parse_from(["nodepass", "server"]).expect("parse server cli");
+        if let Some(Commands::Server(s)) = cli_server.command {
+            assert_eq!(s.password.as_deref(), Some("env_secret_123"));
+        } else {
+            panic!("expected server command");
+        }
+
+        let cli_master = Cli::try_parse_from(["nodepass", "master"]).expect("parse master cli");
+        if let Some(Commands::Master(m)) = cli_master.command {
+            assert_eq!(m.api_key.as_deref(), Some("env_key_456"));
+        } else {
+            panic!("expected master command");
+        }
+
+        std::env::remove_var("NODEPASS_PASSWORD");
+        std::env::remove_var("NODEPASS_API_KEY");
+    }
 }

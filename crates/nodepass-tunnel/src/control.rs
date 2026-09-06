@@ -5,7 +5,7 @@ use nodepass_transport::stream::BoxedStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error};
 
@@ -78,22 +78,33 @@ impl ControlLoop {
 
         // 2. Reader task
         tokio::spawn(async move {
+            const MAX_CONTROL_LINE_LEN: usize = 16384;
             let mut line = Vec::new();
             while !stop_flag.load(Ordering::Relaxed) {
                 line.clear();
-                match buf_reader.read_until(b'\n', &mut line).await {
+                let read_res = (&mut buf_reader)
+                    .take(MAX_CONTROL_LINE_LEN as u64)
+                    .read_until(b'\n', &mut line)
+                    .await;
+                match read_res {
                     Ok(0) => break, // EOF
-                    Ok(_) => match decode_signal(&line, &key_for_reader) {
-                        Ok(plaintext) => match serde_json::from_slice::<Signal>(&plaintext) {
-                            Ok(signal) => {
-                                if signal_tx.send(signal).await.is_err() {
-                                    break;
+                    Ok(_) => {
+                        if line.len() >= MAX_CONTROL_LINE_LEN && !line.ends_with(b"\n") {
+                            error!("Control signal line exceeded maximum allowed length (16KB)");
+                            break;
+                        }
+                        match decode_signal(&line, &key_for_reader) {
+                            Ok(plaintext) => match serde_json::from_slice::<Signal>(&plaintext) {
+                                Ok(signal) => {
+                                    if signal_tx.send(signal).await.is_err() {
+                                        break;
+                                    }
                                 }
-                            }
-                            Err(e) => error!("Control unmarshal error: {}", e),
-                        },
-                        Err(e) => error!("Control decode error: {}", e),
-                    },
+                                Err(e) => error!("Control unmarshal error: {}", e),
+                            },
+                            Err(e) => error!("Control decode error: {}", e),
+                        }
+                    }
                     Err(_) => break,
                 }
             }

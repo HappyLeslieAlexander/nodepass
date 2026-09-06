@@ -292,8 +292,24 @@ impl McpHandler {
                 let new_id = format!("{:08x}", rand::random::<u32>());
                 let inst = Instance::new(new_id.clone(), alias.to_string(), inst_type.to_string(), url_str);
                 self.instances.insert(new_id.clone(), inst);
-                let _ = self.state_mgr.save(&self.instances);
+                let _ = self.state_mgr.save(&self.instances).await;
                 format!("Created instance {}", new_id)
+            }
+            "update_instance" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Some(alias) = args.get("alias").and_then(|v| v.as_str()) {
+                    inst.alias = alias.to_string();
+                }
+                if let Some(restart) = args.get("restart").and_then(|v| v.as_bool()) {
+                    inst.restart = restart;
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Updated instance {}", inst_id)
             }
             "control_instance" => {
                 let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
@@ -313,29 +329,194 @@ impl McpHandler {
                     }
                     "reset" => {
                         if let Some(mut inst) = self.instances.get_mut(inst_id) {
-                            inst.tcprx = 0;
-                            inst.tcptx = 0;
-                            inst.udprx = 0;
-                            inst.udptx = 0;
-                            inst.tcp_rx_base = 0;
-                            inst.tcp_tx_base = 0;
-                            inst.udp_rx_base = 0;
-                            inst.udp_tx_base = 0;
+                            inst.reset_metrics();
                         }
+                        let _ = self.state_mgr.save(&self.instances).await;
                         format!("Reset metrics for instance {}", inst_id)
                     }
                     _ => return MCPResponse::error(id, -32602, format!("Invalid action {}", action), None),
                 }
             }
+            "set_instance_basic" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut updates = std::collections::HashMap::new();
+                for field in &["type", "tunnel_address", "tunnel_port", "target_address", "target_port", "targets", "log"] {
+                    if let Some(v) = args.get(*field).and_then(|v| v.as_str()) {
+                        updates.insert(field.to_string(), v.to_string());
+                    }
+                }
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Err(e) = update_instance_url(&mut inst, updates) {
+                    return MCPResponse::error(id, -32602, e, None);
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Set basic configuration for instance {}", inst_id)
+            }
+            "set_instance_security" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut updates = std::collections::HashMap::new();
+                for field in &["password", "tls", "crt", "key", "sni"] {
+                    if let Some(v) = args.get(*field).and_then(|v| v.as_str()) {
+                        updates.insert(field.to_string(), v.to_string());
+                    }
+                }
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Err(e) = update_instance_url(&mut inst, updates) {
+                    return MCPResponse::error(id, -32602, e, None);
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Set security configuration for instance {}", inst_id)
+            }
+            "set_instance_connection" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut updates = std::collections::HashMap::new();
+                for field in &["mode", "min", "max", "pool"] {
+                    if let Some(v) = args.get(*field).and_then(|v| v.as_str()) {
+                        updates.insert(field.to_string(), v.to_string());
+                    }
+                }
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Err(e) = update_instance_url(&mut inst, updates) {
+                    return MCPResponse::error(id, -32602, e, None);
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Set connection configuration for instance {}", inst_id)
+            }
+            "set_instance_network" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut updates = std::collections::HashMap::new();
+                for field in &["dns", "rate", "slot", "read", "dial"] {
+                    if let Some(v) = args.get(*field).and_then(|v| v.as_str()) {
+                        updates.insert(field.to_string(), v.to_string());
+                    }
+                }
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Err(e) = update_instance_url(&mut inst, updates) {
+                    return MCPResponse::error(id, -32602, e, None);
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Set network configuration for instance {}", inst_id)
+            }
+            "set_instance_protocol" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut updates = std::collections::HashMap::new();
+                for field in &["proxy", "notcp", "noudp"] {
+                    if let Some(v) = args.get(*field).and_then(|v| v.as_str()) {
+                        updates.insert(field.to_string(), v.to_string());
+                    }
+                }
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Err(e) = update_instance_url(&mut inst, updates) {
+                    return MCPResponse::error(id, -32602, e, None);
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Set protocol configuration for instance {}", inst_id)
+            }
+            "set_instance_traffic" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut updates = std::collections::HashMap::new();
+                for field in &["block", "lbs"] {
+                    if let Some(v) = args.get(*field).and_then(|v| v.as_str()) {
+                        updates.insert(field.to_string(), v.to_string());
+                    }
+                }
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Err(e) = update_instance_url(&mut inst, updates) {
+                    return MCPResponse::error(id, -32602, e, None);
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Set traffic configuration for instance {}", inst_id)
+            }
+            "set_instance_advanced" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let mut updates = std::collections::HashMap::new();
+                if let Some(params_obj) = args.get("parameters").and_then(|v| v.as_object()) {
+                    for (k, v) in params_obj {
+                        let val_str = if let Some(s) = v.as_str() {
+                            s.to_string()
+                        } else {
+                            v.to_string()
+                        };
+                        updates.insert(k.clone(), val_str);
+                    }
+                }
+                let mut inst = match self.instances.get_mut(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                if let Err(e) = update_instance_url(&mut inst, updates) {
+                    return MCPResponse::error(id, -32602, e, None);
+                }
+                drop(inst);
+                let _ = self.state_mgr.save(&self.instances).await;
+                format!("Set advanced parameters for instance {}", inst_id)
+            }
+            "get_instance_config" => {
+                let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let inst = match self.instances.get(inst_id) {
+                    Some(i) => i,
+                    None => return MCPResponse::error(id, -32602, format!("Instance {} not found", inst_id), None),
+                };
+                let parsed_url = match url::Url::parse(&inst.url) {
+                    Ok(u) => u,
+                    Err(e) => return MCPResponse::error(id, -32602, format!("Failed to parse instance URL: {}", e), None),
+                };
+                let query_map: std::collections::HashMap<String, String> =
+                    parsed_url.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                let path = parsed_url.path().trim_start_matches('/');
+                let mut target_addr = "";
+                let mut target_port = "";
+                if path.contains(':') {
+                    let parts: Vec<&str> = path.split(':').collect();
+                    target_addr = parts[0];
+                    if parts.len() > 1 { target_port = parts[1]; }
+                }
+                let config_json = json!({
+                    "id": inst_id,
+                    "type": parsed_url.scheme(),
+                    "password": parsed_url.password().unwrap_or(parsed_url.username()),
+                    "tunnel_address": parsed_url.host_str().unwrap_or_default(),
+                    "tunnel_port": parsed_url.port().map(|p| p.to_string()).unwrap_or_default(),
+                    "target_address": target_addr,
+                    "target_port": target_port,
+                    "targets": path,
+                    "parameters": query_map,
+                });
+                serde_json::to_string_pretty(&config_json).unwrap_or_default()
+            }
             "delete_instance" => {
                 let inst_id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
                 self.process_mgr.stop_instance(inst_id).await;
                 self.instances.remove(inst_id);
-                let _ = self.state_mgr.save(&self.instances);
+                let _ = self.state_mgr.save(&self.instances).await;
                 format!("Deleted instance {}", inst_id)
             }
             "export_instances" => {
-                let _ = self.state_mgr.save(&self.instances);
+                let _ = self.state_mgr.save(&self.instances).await;
                 "Exported instances to state file".to_string()
             }
             "import_instances" => {
@@ -344,28 +525,38 @@ impl McpHandler {
             }
             "tcping_target" => {
                 let target = args.get("target").and_then(|v| v.as_str()).unwrap_or_default();
-                let start = Instant::now();
-                let res = match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(target)).await {
-                    Ok(Ok(_)) => TCPingResult {
-                        target: target.to_string(),
-                        connected: true,
-                        latency: start.elapsed().as_millis() as i64,
-                        error: None,
-                    },
-                    Ok(Err(e)) => TCPingResult {
+                if let Err(err) = crate::web::check_tcping_target(target) {
+                    let res = TCPingResult {
                         target: target.to_string(),
                         connected: false,
                         latency: 0,
-                        error: Some(e.to_string()),
-                    },
-                    Err(_) => TCPingResult {
-                        target: target.to_string(),
-                        connected: false,
-                        latency: 0,
-                        error: Some("Timeout".to_string()),
-                    },
-                };
-                serde_json::to_string_pretty(&res).unwrap_or_default()
+                        error: Some(err),
+                    };
+                    serde_json::to_string_pretty(&res).unwrap_or_default()
+                } else {
+                    let start = Instant::now();
+                    let res = match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(target)).await {
+                        Ok(Ok(_)) => TCPingResult {
+                            target: target.to_string(),
+                            connected: true,
+                            latency: start.elapsed().as_millis() as i64,
+                            error: None,
+                        },
+                        Ok(Err(e)) => TCPingResult {
+                            target: target.to_string(),
+                            connected: false,
+                            latency: 0,
+                            error: Some(e.to_string()),
+                        },
+                        Err(_) => TCPingResult {
+                            target: target.to_string(),
+                            connected: false,
+                            latency: 0,
+                            error: Some("Timeout".to_string()),
+                        },
+                    };
+                    serde_json::to_string_pretty(&res).unwrap_or_default()
+                }
             }
             "get_master_info" => {
                 let alias = self.alias.read().clone();
@@ -390,7 +581,7 @@ impl McpHandler {
                 *self.alias.write() = new_alias.to_string();
                 format!("Master alias updated to: {}", new_alias)
             }
-            _ => format!("Executed tool {}", tool_name),
+            _ => return MCPResponse::error(id, -32601, format!("Method not found: {}", tool_name), None),
         };
 
         let result = json!({
@@ -404,6 +595,77 @@ impl McpHandler {
 
         MCPResponse::success(id, result)
     }
+}
+
+fn update_instance_url(inst: &mut Instance, updates: std::collections::HashMap<String, String>) -> Result<(), String> {
+    let mut parsed_url = url::Url::parse(&inst.url).map_err(|e| format!("Invalid URL: {}", e))?;
+
+    if let Some(t) = updates.get("type") {
+        parsed_url.set_scheme(t).map_err(|_| "Invalid scheme".to_string())?;
+        inst.instance_type = t.clone();
+    }
+    if let Some(addr) = updates.get("tunnel_address") {
+        parsed_url.set_host(Some(addr)).map_err(|e| format!("Invalid host: {}", e))?;
+    }
+    if let Some(port_str) = updates.get("tunnel_port") {
+        let port: u16 = port_str.parse().map_err(|_| "Invalid port".to_string())?;
+        parsed_url.set_port(Some(port)).map_err(|_| "Failed to set port".to_string())?;
+    }
+    if let Some(pwd) = updates.get("password") {
+        if pwd.is_empty() {
+            let _ = parsed_url.set_password(None);
+            let _ = parsed_url.set_username("");
+        } else {
+            let _ = parsed_url.set_password(Some(pwd));
+        }
+    }
+    if let Some(targets) = updates.get("targets") {
+        let path = if targets.starts_with('/') { targets.clone() } else { format!("/{}", targets) };
+        parsed_url.set_path(&path);
+    } else if updates.contains_key("target_address") || updates.contains_key("target_port") {
+        let current_path = parsed_url.path().trim_start_matches('/');
+        let mut cur_addr = "127.0.0.1";
+        let mut cur_port = "80";
+        if current_path.contains(':') {
+            let parts: Vec<&str> = current_path.split(':').collect();
+            cur_addr = parts[0];
+            if parts.len() > 1 { cur_port = parts[1]; }
+        }
+        let new_addr = updates.get("target_address").map(|s| s.as_str()).unwrap_or(cur_addr);
+        let new_port = updates.get("target_port").map(|s| s.as_str()).unwrap_or(cur_port);
+        parsed_url.set_path(&format!("{}:{}", new_addr, new_port));
+    }
+
+    let special_keys = [
+        "type", "tunnel_address", "tunnel_port", "target_address", "target_port", "targets", "password",
+    ];
+    let mut query_map: std::collections::BTreeMap<String, String> = parsed_url
+        .query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    for (k, v) in updates {
+        if !special_keys.contains(&k.as_str()) {
+            if v.is_empty() {
+                query_map.remove(&k);
+            } else {
+                query_map.insert(k, v);
+            }
+        }
+    }
+
+    if query_map.is_empty() {
+        parsed_url.set_query(None);
+    } else {
+        let mut pairs = parsed_url.query_pairs_mut();
+        pairs.clear();
+        for (k, v) in &query_map {
+            pairs.append_pair(k, v);
+        }
+    }
+
+    inst.url = parsed_url.to_string();
+    Ok(())
 }
 
 #[cfg(test)]

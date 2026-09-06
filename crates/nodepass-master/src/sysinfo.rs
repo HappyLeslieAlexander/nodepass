@@ -42,7 +42,10 @@ pub fn get_linux_sys_info() -> SystemInfo {
             info.swap_used = swap_total.saturating_sub(swap_free);
         }
 
-        // /proc/stat CPU utilization (simple estimation)
+#[cfg(target_os = "linux")]
+static PREV_CPU: parking_lot::Mutex<Option<(u64, u64)>> = parking_lot::Mutex::new(None);
+
+        // /proc/stat CPU utilization (delta-based estimation)
         if let Ok(content) = fs::read_to_string("/proc/stat") {
             if let Some(line) = content.lines().next() {
                 let parts: Vec<u64> = line
@@ -53,10 +56,19 @@ pub fn get_linux_sys_info() -> SystemInfo {
                 if parts.len() >= 4 {
                     let idle = parts[3];
                     let total: u64 = parts.iter().sum();
-                    if total > 0 {
+                    let mut prev_guard = PREV_CPU.lock();
+                    if let Some((prev_total, prev_idle)) = *prev_guard {
+                        let delta_total = total.saturating_sub(prev_total);
+                        let delta_idle = idle.saturating_sub(prev_idle);
+                        if delta_total > 0 {
+                            let non_idle = delta_total.saturating_sub(delta_idle);
+                            info.cpu = ((non_idle * 100) / delta_total) as i32;
+                        }
+                    } else if total > 0 {
                         let non_idle = total.saturating_sub(idle);
                         info.cpu = ((non_idle * 100) / total) as i32;
                     }
+                    *prev_guard = Some((total, idle));
                 }
             }
         }

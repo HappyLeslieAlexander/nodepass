@@ -1,12 +1,13 @@
 use crate::control::ControlLoop;
 use crate::exchange::data_exchange_with_stats;
+use crate::udp_session::UdpSessionManager;
 use dashmap::DashMap;
 use nodepass_core::address::{DnsCache, TargetSelector};
 use nodepass_core::config::{
     TunnelConfig, POOL_GET_TIMEOUT, REPORT_INTERVAL, UDP_READ_TIMEOUT,
 };
 use nodepass_core::crypto::{
-    create_mode1_client_tls_config, generate_auth_token,
+    constant_time_eq, create_mode1_client_tls_config, generate_auth_token,
 };
 use nodepass_core::protocol::{detect_block_protocol, format_proxy_v1_header, Signal};
 use nodepass_transport::framed::{read_udp_frame, write_udp_frame};
@@ -15,7 +16,6 @@ use nodepass_transport::pool::{
 };
 use nodepass_transport::rate::RateLimiter;
 use nodepass_transport::stats::Stats;
-use nodepass_transport::stream::BoxedStream;
 use serde::Deserialize;
 use std::io;
 use std::net::SocketAddr;
@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
@@ -63,6 +62,10 @@ impl TunnelClient {
             rate_limiter,
             stop_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
     }
 
     pub async fn run(&self) -> io::Result<()> {
@@ -270,6 +273,7 @@ impl TunnelClient {
 
         // 2. Initialize connection pool
         let recorded_fp = Arc::new(parking_lot::Mutex::new(None));
+        let is_verified = Arc::new(AtomicBool::new(cfg.tls_code != "1"));
         let pool: Arc<dyn TransportPool> = match cfg.pool_type.as_str() {
             "1" => {
                 // QUIC pool
@@ -362,11 +366,17 @@ impl TunnelClient {
             let cfg_clone = cfg.clone();
             let stats_clone = self.stats.clone();
             let rate_limiter_clone = self.rate_limiter.clone();
+            let is_verified_tcp = Arc::clone(&is_verified);
 
             tokio::spawn(async move {
                 if let Some(target) = cfg_clone.target_addrs.first() {
                     if let Ok(listener) = TcpListener::bind(target).await {
                         while let Ok((target_conn, remote_addr)) = listener.accept().await {
+                            if !is_verified_tcp.load(Ordering::SeqCst) {
+                                warn!("Dropping TCP connection: TLS Mode 1 not yet verified");
+                                drop(target_conn);
+                                continue;
+                            }
                             if !stats_clone.try_acquire_slot(false) {
                                 warn!("TCP slot limit reached");
                                 continue;
@@ -401,49 +411,65 @@ impl TunnelClient {
                 let control_tx_udp = control_loop.sender();
                 let cfg_udp = cfg.clone();
                 let stats_udp = self.stats.clone();
+                let is_verified_udp = Arc::clone(&is_verified);
 
                 tokio::spawn(async move {
                     if let Some(target) = cfg_udp.target_addrs.first() {
                         if let Ok(udp_sock) = UdpSocket::bind(target).await {
                             let udp_sock = Arc::new(udp_sock);
-                            let sessions: Arc<DashMap<SocketAddr, Arc<Mutex<BoxedStream>>>> =
-                                Arc::new(DashMap::new());
+                            let sessions = UdpSessionManager::new();
 
                             let mut buf = [0u8; 65535];
                             while let Ok((n, client_addr)) = udp_sock.recv_from(&mut buf).await {
-                                if let Some(session_stream) = sessions.get(&client_addr) {
+                                if !is_verified_udp.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                if let Some(session_tx) = sessions.get(&client_addr) {
                                     stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
-                                    let mut lock = session_stream.lock().await;
-                                    let _ = write_udp_frame(&mut *lock, &buf[..n]).await;
+                                    let _ = session_tx.try_send(buf[..n].to_vec());
                                 } else {
                                     if !stats_udp.try_acquire_slot(true) {
                                         continue;
                                     }
                                     if let Ok((id, pool_conn)) = pool_udp.incoming_get(POOL_GET_TIMEOUT).await {
                                         let _ = control_tx_udp.send(Signal::udp(client_addr.to_string(), id)).await;
-                                        let stream_arc = Arc::new(Mutex::new(pool_conn));
-                                        sessions.insert(client_addr, Arc::clone(&stream_arc));
+                                        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                                        sessions.insert(client_addr, tx.clone());
 
                                         stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
-                                        let mut lock = stream_arc.lock().await;
-                                        let _ = write_udp_frame(&mut *lock, &buf[..n]).await;
-                                        drop(lock);
+                                        let _ = tx.try_send(buf[..n].to_vec());
 
                                         let udp_sock_clone = Arc::clone(&udp_sock);
-                                        let sessions_clone = Arc::clone(&sessions);
+                                        let sessions_clone = sessions.clone();
                                         let stats_clone = stats_udp.clone();
 
                                         tokio::spawn(async move {
-                                            let mut resp_buf = [0u8; 65535];
-                                            loop {
-                                                let mut lock = stream_arc.lock().await;
-                                                match read_udp_frame(&mut *lock, &mut resp_buf, UDP_READ_TIMEOUT).await {
-                                                    Ok(m) if m > 0 => {
-                                                        stats_clone.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
-                                                        let _ = udp_sock_clone.send_to(&resp_buf[..m], client_addr).await;
+                                            let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
+
+                                            let writer_task = async {
+                                                while let Some(data) = rx.recv().await {
+                                                    if write_udp_frame(&mut w_stream, &data).await.is_err() {
+                                                        break;
                                                     }
-                                                    _ => break,
                                                 }
+                                            };
+
+                                            let reader_task = async {
+                                                let mut resp_buf = [0u8; 65535];
+                                                loop {
+                                                    match read_udp_frame(&mut r_stream, &mut resp_buf, UDP_READ_TIMEOUT).await {
+                                                        Ok(m) if m > 0 => {
+                                                            stats_clone.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
+                                                            let _ = udp_sock_clone.send_to(&resp_buf[..m], client_addr).await;
+                                                        }
+                                                        _ => break,
+                                                    }
+                                                }
+                                            };
+
+                                            tokio::select! {
+                                                _ = writer_task => {},
+                                                _ = reader_task => {},
                                             }
                                             sessions_clone.remove(&client_addr);
                                             stats_clone.release_slot(true);
@@ -469,6 +495,10 @@ impl TunnelClient {
         while let Some(signal) = control_loop.recv_signal().await {
             match signal.action_type.as_str() {
                 "tcp" => {
+                    if !is_verified.load(Ordering::SeqCst) {
+                        warn!("Dropping incoming TCP signal: TLS Mode 1 not yet verified");
+                        continue;
+                    }
                     if let Some(id) = signal.pool_conn_id {
                         let pool_clone = Arc::clone(&pool);
                         let selector = Arc::clone(&selector);
@@ -509,6 +539,10 @@ impl TunnelClient {
                     }
                 }
                 "udp" => {
+                    if !is_verified.load(Ordering::SeqCst) {
+                        warn!("Dropping incoming UDP signal: TLS Mode 1 not yet verified");
+                        continue;
+                    }
                     // Pooled mode UDP: when data_flow == "-", server received UDP datagram and requested client to dial target UDP
                     if let Some(id) = signal.pool_conn_id {
                         let pool_clone = Arc::clone(&pool);
@@ -581,15 +615,29 @@ impl TunnelClient {
                 }
                 "verify" => {
                     // TLS Mode 1 fingerprint check: compare received fingerprint with recorded cert
-                    if let Some(ref fp) = signal.fingerprint {
-                        let recorded = recorded_fp.lock().clone();
-                        if let Some(ref expected_fp) = recorded {
-                            if fp != expected_fp {
-                                warn!("TLS code-1: fingerprint mismatch: expected {} but got {}", expected_fp, fp);
-                                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "TLS fingerprint mismatch"));
+                    match signal.fingerprint.as_deref() {
+                        Some(fp) => {
+                            let recorded = recorded_fp.lock().clone();
+                            match recorded.as_deref() {
+                                Some(expected_fp) => {
+                                    if !constant_time_eq(fp.as_bytes(), expected_fp.as_bytes()) {
+                                        warn!("TLS code-1: fingerprint mismatch: expected {} but got {}", expected_fp, fp);
+                                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "TLS fingerprint mismatch"));
+                                    }
+                                    is_verified.store(true, Ordering::SeqCst);
+                                    let _ = control_loop.send_signal(Signal::verify("00000000", fp.to_string())).await;
+                                    info!("TLS code-1: RAM cert verified with sha256 fingerprint: {}", fp);
+                                }
+                                None => {
+                                    warn!("TLS code-1: verify signal received but no certificate fingerprint was recorded");
+                                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "No TLS fingerprint recorded"));
+                                }
                             }
                         }
-                        info!("TLS code-1: RAM cert verified with sha256 fingerprint: {}", fp);
+                        None => {
+                            warn!("TLS code-1: verify signal missing fingerprint");
+                            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Missing TLS fingerprint in verify signal"));
+                        }
                     }
                 }
                 "flush" => {

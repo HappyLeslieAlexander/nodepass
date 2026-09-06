@@ -56,10 +56,8 @@ where
             };
 
             if n == 0 {
-                // EOF on s1: propagate half-close FIN to s2 if no timeout configured
-                if idle_timeout == Duration::ZERO {
-                    let _ = w2.shutdown().await;
-                }
+                // EOF on s1: propagate half-close FIN to s2
+                let _ = w2.shutdown().await;
                 break;
             }
 
@@ -95,10 +93,8 @@ where
             };
 
             if n == 0 {
-                // EOF on s2: propagate half-close FIN to s1 if no timeout configured
-                if idle_timeout == Duration::ZERO {
-                    let _ = w1.shutdown().await;
-                }
+                // EOF on s2: propagate half-close FIN to s1
+                let _ = w1.shutdown().await;
                 break;
             }
 
@@ -141,5 +137,34 @@ mod tests {
         let mut buf2 = [0u8; 12];
         s1.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"pong from s2");
+    }
+
+    #[tokio::test]
+    async fn test_data_exchange_with_timeout_propagates_fin() {
+        let (c1, mut s1) = tokio::io::duplex(1024);
+        let (c2, mut s2) = tokio::io::duplex(1024);
+
+        let handle = tokio::spawn(async move {
+            data_exchange(c1, c2, Duration::from_secs(5), 1024).await
+        });
+
+        s1.write_all(b"hello with timeout").await.unwrap();
+        let mut buf = [0u8; 18];
+        s2.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello with timeout");
+
+        // Half-close s1
+        drop(s1);
+
+        // s2 should receive EOF
+        let mut eof_buf = [0u8; 16];
+        let n = s2.read(&mut eof_buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        // Drop s2 to close reverse path
+        drop(s2);
+
+        let res = handle.await.unwrap();
+        assert!(res.is_ok());
     }
 }

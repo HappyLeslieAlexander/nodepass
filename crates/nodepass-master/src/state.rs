@@ -47,7 +47,7 @@ impl StateManager {
         }
     }
 
-    pub fn save(&self, instances: &DashMap<String, Instance>) -> io::Result<()> {
+    pub fn save_sync(&self, instances: &DashMap<String, Instance>) -> io::Result<()> {
         let _guard = self.lock.lock();
         let map: HashMap<String, Instance> = instances
             .iter()
@@ -66,6 +66,29 @@ impl StateManager {
         fs::rename(&temp_path, &self.path)?;
         Ok(())
     }
+
+    pub async fn save(&self, instances: &DashMap<String, Instance>) -> io::Result<()> {
+        let map: HashMap<String, Instance> = instances
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let serialized = serde_json::to_string_pretty(&map)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            let temp_path = path.with_extension("tmp");
+            fs::write(&temp_path, serialized.as_bytes())?;
+            fs::rename(&temp_path, &path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+    }
 }
 
 #[cfg(test)]
@@ -73,8 +96,8 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_state_save_and_load() {
+    #[tokio::test]
+    async fn test_state_save_and_load() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         let mgr = StateManager::new(path.clone());
@@ -88,7 +111,7 @@ mod tests {
         );
         instances.insert("test-1".to_string(), inst);
 
-        mgr.save(&instances).unwrap();
+        mgr.save(&instances).await.unwrap();
 
         let loaded = DashMap::new();
         mgr.load(&loaded).unwrap();

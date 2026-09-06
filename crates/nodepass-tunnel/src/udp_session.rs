@@ -1,78 +1,64 @@
 use dashmap::DashMap;
-use nodepass_transport::stream::BoxedStream;
-use parking_lot::Mutex as SyncMutex;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
-pub struct UdpSession {
-    pub stream: Arc<Mutex<BoxedStream>>,
-    pub last_active: Arc<SyncMutex<Instant>>,
-}
-
-/// Thread-safe UDP session table mapping external client addresses to persistent streams.
-#[derive(Clone)]
+/// Thread-safe UDP session table mapping external client addresses to channel senders.
+/// Using channel senders eliminates lock contention between UDP frame reads and writes.
+#[derive(Clone, Default)]
 pub struct UdpSessionManager {
-    sessions: Arc<DashMap<SocketAddr, UdpSession>>,
-    timeout: Duration,
+    sessions: Arc<DashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
 }
 
 impl UdpSessionManager {
-    pub fn new(timeout: Duration) -> Self {
-        let mgr = Self {
+    pub fn new() -> Self {
+        Self {
             sessions: Arc::new(DashMap::new()),
-            timeout,
-        };
-
-        // Spawn background cleanup task
-        let sessions = Arc::clone(&mgr.sessions);
-        tokio::spawn(async move {
-            let interval = Duration::from_secs(5);
-            loop {
-                tokio::time::sleep(interval).await;
-                let now = Instant::now();
-                sessions.retain(|_addr, session| {
-                    let last = *session.last_active.lock();
-                    now.duration_since(last) < timeout
-                });
-            }
-        });
-
-        mgr
+        }
     }
 
-    pub fn timeout(&self) -> Duration {
-        self.timeout
+    pub fn get(&self, addr: &SocketAddr) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.sessions.get(addr).map(|entry| entry.value().clone())
     }
 
-    pub fn get(&self, addr: &SocketAddr) -> Option<UdpSession> {
-        self.sessions.get(addr).map(|entry| {
-            let session = entry.value();
-            *session.last_active.lock() = Instant::now();
-            UdpSession {
-                stream: Arc::clone(&session.stream),
-                last_active: Arc::clone(&session.last_active),
-            }
-        })
-    }
-
-    pub fn insert(&self, addr: SocketAddr, stream: BoxedStream) -> UdpSession {
-        let session = UdpSession {
-            stream: Arc::new(Mutex::new(stream)),
-            last_active: Arc::new(SyncMutex::new(Instant::now())),
-        };
-        self.sessions.insert(
-            addr,
-            UdpSession {
-                stream: Arc::clone(&session.stream),
-                last_active: Arc::clone(&session.last_active),
-            },
-        );
-        session
+    pub fn insert(&self, addr: SocketAddr, sender: mpsc::Sender<Vec<u8>>) {
+        self.sessions.insert(addr, sender);
     }
 
     pub fn remove(&self, addr: &SocketAddr) {
         self.sessions.remove(addr);
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_udp_session_manager_crud() {
+        let mgr = UdpSessionManager::new();
+        assert!(mgr.is_empty());
+
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(32);
+
+        mgr.insert(addr, tx);
+        assert_eq!(mgr.len(), 1);
+        assert!(!mgr.is_empty());
+
+        let retrieved = mgr.get(&addr);
+        assert!(retrieved.is_some());
+
+        mgr.remove(&addr);
+        assert_eq!(mgr.len(), 0);
+        assert!(mgr.get(&addr).is_none());
     }
 }

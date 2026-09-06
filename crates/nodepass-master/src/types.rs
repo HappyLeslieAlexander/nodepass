@@ -99,6 +99,21 @@ impl Instance {
             deleted: false,
         }
     }
+
+    pub fn reset_metrics(&mut self) {
+        self.tcp_rx_reset += self.tcprx.saturating_sub(self.tcp_rx_base);
+        self.tcp_tx_reset += self.tcptx.saturating_sub(self.tcp_tx_base);
+        self.udp_rx_reset += self.udprx.saturating_sub(self.udp_rx_base);
+        self.udp_tx_reset += self.udptx.saturating_sub(self.udp_tx_base);
+        self.tcprx = 0;
+        self.tcptx = 0;
+        self.udprx = 0;
+        self.udptx = 0;
+        self.tcp_rx_base = 0;
+        self.tcp_tx_base = 0;
+        self.udp_rx_base = 0;
+        self.udp_tx_base = 0;
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -65,7 +65,18 @@ pub fn create_router(state: AppState) -> Router {
 fn check_auth(headers: &HeaderMap, expected_key: &str) -> bool {
     if let Some(val) = headers.get("X-API-Key").or_else(|| headers.get("x-api-key")) {
         if let Ok(str_val) = val.to_str() {
-            return str_val == expected_key;
+            if nodepass_core::crypto::constant_time_eq(str_val.as_bytes(), expected_key.as_bytes()) {
+                return true;
+            }
+        }
+    }
+    if let Some(val) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(str_val) = val.to_str() {
+            if let Some(token) = str_val.strip_prefix("Bearer ").or_else(|| str_val.strip_prefix("bearer ")) {
+                if nodepass_core::crypto::constant_time_eq(token.trim().as_bytes(), expected_key.as_bytes()) {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -129,7 +140,7 @@ async fn handle_create_instance(
     );
 
     state.instances.insert(new_id.clone(), instance.clone());
-    let _ = state.state_mgr.save(&state.instances);
+    let _ = state.state_mgr.save(&state.instances).await;
     let _ = state.process_mgr.start_instance(&new_id).await;
 
     Ok((StatusCode::CREATED, Json(instance)))
@@ -180,7 +191,7 @@ async fn handle_update_instance(
 
     let snap = entry.clone();
     drop(entry);
-    let _ = state.state_mgr.save(&state.instances);
+    let _ = state.state_mgr.save(&state.instances).await;
 
     Ok(Json(snap))
 }
@@ -196,7 +207,7 @@ async fn handle_delete_instance(
 
     state.process_mgr.stop_instance(&id).await;
     state.instances.remove(&id);
-    let _ = state.state_mgr.save(&state.instances);
+    let _ = state.state_mgr.save(&state.instances).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -221,6 +232,13 @@ async fn handle_control_instance(
         }
         "restart" => {
             let _ = state.process_mgr.restart_instance(&id).await;
+            Ok(StatusCode::OK)
+        }
+        "reset" => {
+            if let Some(mut inst) = state.instances.get_mut(&id) {
+                inst.reset_metrics();
+            }
+            let _ = state.state_mgr.save(&state.instances).await;
             Ok(StatusCode::OK)
         }
         _ => Err(StatusCode::BAD_REQUEST),
@@ -281,6 +299,26 @@ struct TCPingQuery {
     target: String,
 }
 
+pub fn check_tcping_target(target: &str) -> Result<(), String> {
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&target) {
+        for addr in addrs {
+            match addr.ip() {
+                std::net::IpAddr::V4(ipv4) => {
+                    if ipv4.is_link_local() || ipv4.is_broadcast() || ipv4.is_unspecified() {
+                        return Err("Access to link-local or prohibited IP is blocked".to_string());
+                    }
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    if ipv6.is_unspecified() || ((ipv6.segments()[0] & 0xffc0) == 0xfe80) {
+                        return Err("Access to link-local or prohibited IP is blocked".to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_tcping(
     headers: HeaderMap,
     Query(query): Query<TCPingQuery>,
@@ -288,6 +326,15 @@ async fn handle_tcping(
 ) -> Result<Json<TCPingResult>, StatusCode> {
     if !check_auth(&headers, &state.api_key) {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    if let Err(err) = check_tcping_target(&query.target) {
+        return Ok(Json(TCPingResult {
+            target: query.target,
+            connected: false,
+            latency: 0,
+            error: Some(err),
+        }));
     }
 
     let start = Instant::now();

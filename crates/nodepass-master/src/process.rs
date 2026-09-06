@@ -4,7 +4,7 @@ use regex::Regex;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use tracing::debug;
@@ -89,17 +89,28 @@ impl ProcessManager {
             let re_for_stdout = re.clone();
             let id_for_stdout = instance_id.clone();
 
+            const MAX_LOG_LINE_LEN: usize = 65536;
+
             if let Some(out) = stdout {
                 tokio::spawn(async move {
-                    let mut reader = BufReader::new(out).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        Self::process_log_line(
-                            &id_for_stdout,
-                            &line,
-                            &instances_for_stdout,
-                            &event_tx_for_stdout,
-                            &re_for_stdout,
-                        );
+                    let mut reader = BufReader::new(out);
+                    let mut line_buf = Vec::new();
+                    loop {
+                        line_buf.clear();
+                        match (&mut reader).take(MAX_LOG_LINE_LEN as u64).read_until(b'\n', &mut line_buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let line = String::from_utf8_lossy(&line_buf).trim_end_matches(&['\r', '\n'][..]).to_string();
+                                Self::process_log_line(
+                                    &id_for_stdout,
+                                    &line,
+                                    &instances_for_stdout,
+                                    &event_tx_for_stdout,
+                                    &re_for_stdout,
+                                );
+                            }
+                            Err(_) => break,
+                        }
                     }
                 });
             }
@@ -111,15 +122,24 @@ impl ProcessManager {
 
             if let Some(err) = stderr {
                 tokio::spawn(async move {
-                    let mut reader = BufReader::new(err).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        Self::process_log_line(
-                            &id_for_stderr,
-                            &line,
-                            &instances_for_stderr,
-                            &event_tx_for_stderr,
-                            &re_for_stderr,
-                        );
+                    let mut reader = BufReader::new(err);
+                    let mut line_buf = Vec::new();
+                    loop {
+                        line_buf.clear();
+                        match (&mut reader).take(MAX_LOG_LINE_LEN as u64).read_until(b'\n', &mut line_buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let line = String::from_utf8_lossy(&line_buf).trim_end_matches(&['\r', '\n'][..]).to_string();
+                                Self::process_log_line(
+                                    &id_for_stderr,
+                                    &line,
+                                    &instances_for_stderr,
+                                    &event_tx_for_stderr,
+                                    &re_for_stderr,
+                                );
+                            }
+                            Err(_) => break,
+                        }
                     }
                 });
             }
@@ -174,6 +194,13 @@ impl ProcessManager {
                 instance: snap,
                 logs: String::new(),
             });
+        }
+    }
+
+    pub async fn stop_all(&self) {
+        let ids: Vec<String> = self.running_processes.iter().map(|e| e.key().clone()).collect();
+        for id in ids {
+            self.stop_instance(&id).await;
         }
     }
 

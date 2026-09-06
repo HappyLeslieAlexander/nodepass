@@ -47,6 +47,10 @@ impl ProcessManager {
         entry.tcp_tx_base = entry.tcptx;
         entry.udp_rx_base = entry.udprx;
         entry.udp_tx_base = entry.udptx;
+        entry.tcp_rx_reset = 0;
+        entry.tcp_tx_reset = 0;
+        entry.udp_rx_reset = 0;
+        entry.udp_tx_reset = 0;
 
         let exe_path = std::env::current_exe()
             .map_err(|e| format!("Failed to get current exe path: {}", e))?;

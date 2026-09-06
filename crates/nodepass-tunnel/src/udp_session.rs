@@ -21,6 +21,17 @@ impl UdpSessionManager {
         self.sessions.get(addr).map(|entry| entry.value().clone())
     }
 
+    pub fn get_active(&self, addr: &SocketAddr) -> Option<mpsc::Sender<Vec<u8>>> {
+        if let Some(entry) = self.sessions.get(addr) {
+            if !entry.value().is_closed() {
+                return Some(entry.value().clone());
+            }
+            drop(entry);
+            self.sessions.remove(addr);
+        }
+        None
+    }
+
     pub fn insert(&self, addr: SocketAddr, sender: mpsc::Sender<Vec<u8>>) {
         self.sessions.insert(addr, sender);
     }

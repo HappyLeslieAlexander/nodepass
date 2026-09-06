@@ -9,7 +9,7 @@ use nodepass_tunnel::client::TunnelClient;
 use nodepass_tunnel::server::TunnelServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::info;
 use url::Url;
@@ -235,12 +235,12 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
         "client" => {
             info!("Starting NodePass client: {}", url_str);
             let client = Arc::new(TunnelClient::new(config));
-            let client_task = {
+            let mut client_task = {
                 let client = Arc::clone(&client);
                 tokio::spawn(async move { client.run().await })
             };
             tokio::select! {
-                res = client_task => {
+                res = &mut client_task => {
                     match res {
                         Ok(Ok(())) => {},
                         Ok(Err(e)) => return Err(e.into()),
@@ -250,18 +250,19 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
                 _ = wait_for_shutdown_signal() => {
                     info!("Shutdown signal received, stopping client...");
                     client.stop();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), client_task).await;
                 }
             }
         }
         "server" => {
             info!("Starting NodePass server: {}", url_str);
             let server = Arc::new(TunnelServer::new(config));
-            let server_task = {
+            let mut server_task = {
                 let server = Arc::clone(&server);
                 tokio::spawn(async move { server.run().await })
             };
             tokio::select! {
-                res = server_task => {
+                res = &mut server_task => {
                     match res {
                         Ok(Ok(())) => {},
                         Ok(Err(e)) => return Err(e.into()),
@@ -271,6 +272,7 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
                 _ = wait_for_shutdown_signal() => {
                     info!("Shutdown signal received, stopping server...");
                     server.stop();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
                 }
             }
         }
@@ -278,7 +280,19 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
             let listen = format!("{}:{}", parsed_url.host_str().unwrap_or("127.0.0.1"), parsed_url.port().unwrap_or(8080));
             let prefix = parsed_url.path();
             let prefix = if prefix.is_empty() || prefix == "/" { "/api/v1" } else { prefix };
-            let key = parsed_url.password();
+            let key = if let Some(pass) = parsed_url.password() {
+                if !pass.is_empty() {
+                    Some(pass)
+                } else if !parsed_url.username().is_empty() {
+                    Some(parsed_url.username())
+                } else {
+                    None
+                }
+            } else if !parsed_url.username().is_empty() {
+                Some(parsed_url.username())
+            } else {
+                None
+            };
             run_master(&listen, key, prefix).await?;
         }
         _ => {
@@ -406,5 +420,28 @@ mod tests {
 
         std::env::remove_var("NODEPASS_PASSWORD");
         std::env::remove_var("NODEPASS_API_KEY");
+    }
+
+    #[test]
+    fn test_master_url_credential_extraction() {
+        let u1 = Url::parse("master://mysecret@127.0.0.1:8080/api/v1").unwrap();
+        let key1 = if let Some(pass) = u1.password() {
+            if !pass.is_empty() { Some(pass) } else if !u1.username().is_empty() { Some(u1.username()) } else { None }
+        } else if !u1.username().is_empty() {
+            Some(u1.username())
+        } else {
+            None
+        };
+        assert_eq!(key1, Some("mysecret"));
+
+        let u2 = Url::parse("master://:anothersecret@127.0.0.1:8080/api/v1").unwrap();
+        let key2 = if let Some(pass) = u2.password() {
+            if !pass.is_empty() { Some(pass) } else if !u2.username().is_empty() { Some(u2.username()) } else { None }
+        } else if !u2.username().is_empty() {
+            Some(u2.username())
+        } else {
+            None
+        };
+        assert_eq!(key2, Some("anothersecret"));
     }
 }

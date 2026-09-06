@@ -33,6 +33,8 @@ pub struct TunnelServer {
     selector: Arc<TargetSelector>,
     rate_limiter: Option<RateLimiter>,
     stop_flag: Arc<AtomicBool>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl TunnelServer {
@@ -45,6 +47,7 @@ impl TunnelServer {
             Duration::from_secs(300),
         ));
         let rate_limiter = RateLimiter::new(config.rate_limit, config.rate_limit);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             config: Arc::new(parking_lot::RwLock::new(config)),
             stats: Stats::new(65536),
@@ -52,11 +55,14 @@ impl TunnelServer {
             selector,
             rate_limiter,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        let _ = self.shutdown_tx.send(true);
     }
 
     pub async fn run(&self) -> io::Result<()> {
@@ -277,7 +283,7 @@ impl TunnelServer {
                                 if !is_verified_udp.load(Ordering::SeqCst) {
                                     continue;
                                 }
-                                if let Some(session_tx) = sessions.get(&client_addr) {
+                                if let Some(session_tx) = sessions.get_active(&client_addr) {
                                     stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
                                     let _ = session_tx.try_send(buf[..n].to_vec());
                                 } else {
@@ -295,27 +301,39 @@ impl TunnelServer {
                                         let udp_sock_clone = Arc::clone(&udp_sock);
                                         let sessions_clone = sessions.clone();
                                         let stats_clone = stats_udp.clone();
+                                        let stats_reader = stats_clone.clone();
 
                                         tokio::spawn(async move {
                                             let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
+                                            let last_active = Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+                                            let last_active_writer = Arc::clone(&last_active);
+                                            let last_active_reader = Arc::clone(&last_active);
 
-                                            let writer_task = async {
+                                            let writer_task = async move {
                                                 while let Some(data) = rx.recv().await {
+                                                    *last_active_writer.lock() = std::time::Instant::now();
                                                     if write_udp_frame(&mut w_stream, &data).await.is_err() {
                                                         break;
                                                     }
                                                 }
                                             };
 
-                                            let reader_task = async {
+                                            let reader_task = async move {
                                                 let mut resp_buf = [0u8; 65535];
                                                 loop {
                                                     match read_udp_frame(&mut r_stream, &mut resp_buf, UDP_READ_TIMEOUT).await {
                                                         Ok(m) if m > 0 => {
-                                                            stats_clone.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
+                                                            *last_active_reader.lock() = std::time::Instant::now();
+                                                            stats_reader.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
                                                             let _ = udp_sock_clone.send_to(&resp_buf[..m], client_addr).await;
                                                         }
-                                                        _ => break,
+                                                        Ok(_) => break,
+                                                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                                            if last_active_reader.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                                break;
+                                                            }
+                                                        }
+                                                        Err(_) => break,
                                                     }
                                                 }
                                             };
@@ -345,7 +363,24 @@ impl TunnelServer {
         let read_timeout = cfg.read_timeout;
         let rate_limiter = self.rate_limiter.clone();
 
-        while let Some(signal) = control_loop.recv_signal().await {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        loop {
+            let signal = tokio::select! {
+                res = control_loop.recv_signal() => {
+                    match res {
+                        Some(s) => s,
+                        None => break,
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Tunnel server shutdown triggered");
+                        control_loop.stop();
+                        break;
+                    }
+                    continue;
+                }
+            };
             match signal.action_type.as_str() {
                 "tcp" => {
                     if !is_verified.load(Ordering::SeqCst) {
@@ -412,31 +447,48 @@ impl TunnelServer {
                                                 let stats_t = stats.clone();
 
                                                 let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
+                                                let last_active = Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+                                                let last_active_task1 = Arc::clone(&last_active);
+                                                let last_active_task2 = Arc::clone(&last_active);
 
-                                                let task1 = async {
+                                                let task1 = async move {
                                                     let mut buf = [0u8; 65535];
                                                     loop {
                                                         match read_udp_frame(&mut r_stream, &mut buf, UDP_READ_TIMEOUT).await {
                                                             Ok(n) if n > 0 => {
+                                                                *last_active_task1.lock() = std::time::Instant::now();
                                                                 stats_t.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
                                                                 let _ = target_sock.send(&buf[..n]).await;
                                                             }
-                                                            _ => break,
+                                                            Ok(_) => break,
+                                                            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                                                if last_active_task1.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                                    break;
+                                                                }
+                                                            }
+                                                            Err(_) => break,
                                                         }
                                                     }
                                                 };
 
-                                                let task2 = async {
+                                                let task2 = async move {
                                                     let mut buf = [0u8; 65535];
                                                     loop {
                                                         match tokio::time::timeout(UDP_READ_TIMEOUT, target_sock_read.recv(&mut buf)).await {
                                                             Ok(Ok(n)) if n > 0 => {
+                                                                *last_active_task2.lock() = std::time::Instant::now();
                                                                 stats_t.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
                                                                 if write_udp_frame(&mut w_stream, &buf[..n]).await.is_err() {
                                                                     break;
                                                                 }
                                                             }
-                                                            _ => break,
+                                                            Ok(Ok(_)) => break,
+                                                            Ok(Err(_)) => break,
+                                                            Err(_) => {
+                                                                if last_active_task2.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                                    break;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 };

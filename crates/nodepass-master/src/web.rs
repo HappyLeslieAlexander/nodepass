@@ -304,13 +304,13 @@ pub fn check_tcping_target(target: &str) -> Result<(), String> {
         for addr in addrs {
             match addr.ip() {
                 std::net::IpAddr::V4(ipv4) => {
-                    if ipv4.is_link_local() || ipv4.is_broadcast() || ipv4.is_unspecified() {
-                        return Err("Access to link-local or prohibited IP is blocked".to_string());
+                    if ipv4.is_link_local() || ipv4.is_broadcast() || ipv4.is_unspecified() || ipv4.is_loopback() {
+                        return Err("Access to loopback, link-local, or prohibited IP is blocked".to_string());
                     }
                 }
                 std::net::IpAddr::V6(ipv6) => {
-                    if ipv6.is_unspecified() || ((ipv6.segments()[0] & 0xffc0) == 0xfe80) {
-                        return Err("Access to link-local or prohibited IP is blocked".to_string());
+                    if ipv6.is_unspecified() || ipv6.is_loopback() || ((ipv6.segments()[0] & 0xffc0) == 0xfe80) {
+                        return Err("Access to loopback, link-local, or prohibited IP is blocked".to_string());
                     }
                 }
             }

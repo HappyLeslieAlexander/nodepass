@@ -81,7 +81,7 @@ impl StateManager {
             let serialized = serde_json::to_string_pretty(&map)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-            let temp_path = path.with_extension("tmp");
+            let temp_path = path.with_extension(format!("{}.tmp", rand::random::<u64>()));
             fs::write(&temp_path, serialized.as_bytes())?;
             fs::rename(&temp_path, &path)?;
             Ok(())

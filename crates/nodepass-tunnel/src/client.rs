@@ -42,6 +42,8 @@ pub struct TunnelClient {
     selector: Arc<TargetSelector>,
     rate_limiter: Option<RateLimiter>,
     stop_flag: Arc<AtomicBool>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl TunnelClient {
@@ -54,6 +56,7 @@ impl TunnelClient {
             Duration::from_secs(300),
         ));
         let rate_limiter = RateLimiter::new(config.rate_limit, config.rate_limit);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             config: Arc::new(parking_lot::RwLock::new(config)),
             stats: Stats::new(65536),
@@ -61,11 +64,14 @@ impl TunnelClient {
             selector,
             rate_limiter,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        let _ = self.shutdown_tx.send(true);
     }
 
     pub async fn run(&self) -> io::Result<()> {
@@ -190,62 +196,72 @@ impl TunnelClient {
             });
         }
 
+        let mut shutdown_rx = self.shutdown_rx.clone();
         while !self.stop_flag.load(Ordering::Relaxed) {
-            match listener.accept().await {
-                Ok((client_conn, client_addr)) => {
-                    if !stats.try_acquire_slot(false) {
-                        warn!("Single mode: TCP slot limit reached");
-                        continue;
-                    }
-
-                    let selector = Arc::clone(&selector);
-                    let stats = stats.clone();
-                    let rate_limiter = rate_limiter.clone();
-                    tokio::spawn(async move {
-                        // Protocol peek
-                        let mut peek_buf = [0u8; 8];
-                        if let Ok(n) = client_conn.peek(&mut peek_buf).await {
-                            if let Some(proto) = detect_block_protocol(
-                                &peek_buf[..n],
-                                block_socks,
-                                block_http,
-                                block_tls,
-                            ) {
-                                warn!("Single mode: blocked protocol {} from {}", proto, client_addr);
-                                stats.release_slot(false);
-                                return;
+            tokio::select! {
+                accept_res = listener.accept() => {
+                    match accept_res {
+                        Ok((client_conn, client_addr)) => {
+                            if !stats.try_acquire_slot(false) {
+                                warn!("Single mode: TCP slot limit reached");
+                                continue;
                             }
-                        }
 
-                        // Dial target
-                        if let Ok((_target_str, target_addr)) = selector.select_next().await {
-                            if let Ok(mut target_conn) = TcpStream::connect(target_addr).await {
-                                if proxy_enabled {
-                                    let hdr = format_proxy_v1_header(client_addr, target_addr);
-                                    let _ = tokio::io::AsyncWriteExt::write_all(
-                                        &mut target_conn,
-                                        hdr.as_bytes(),
-                                    )
-                                    .await;
+                            let selector = Arc::clone(&selector);
+                            let stats = stats.clone();
+                            let rate_limiter = rate_limiter.clone();
+                            tokio::spawn(async move {
+                                // Protocol peek
+                                let mut peek_buf = [0u8; 8];
+                                if let Ok(n) = client_conn.peek(&mut peek_buf).await {
+                                    if let Some(proto) = detect_block_protocol(
+                                        &peek_buf[..n],
+                                        block_socks,
+                                        block_http,
+                                        block_tls,
+                                    ) {
+                                        warn!("Single mode: blocked protocol {} from {}", proto, client_addr);
+                                        stats.release_slot(false);
+                                        return;
+                                    }
                                 }
 
-                                let _ = data_exchange_with_stats(
-                                    client_conn,
-                                    target_conn,
-                                    read_timeout,
-                                    16384,
-                                    Some(stats.tcp_rx.clone()),
-                                    Some(stats.tcp_tx.clone()),
-                                    rate_limiter,
-                                )
-                                .await;
-                            }
+                                // Dial target
+                                if let Ok((_target_str, target_addr)) = selector.select_next().await {
+                                    if let Ok(mut target_conn) = TcpStream::connect(target_addr).await {
+                                        if proxy_enabled {
+                                            let hdr = format_proxy_v1_header(client_addr, target_addr);
+                                            let _ = tokio::io::AsyncWriteExt::write_all(
+                                                &mut target_conn,
+                                                hdr.as_bytes(),
+                                            )
+                                            .await;
+                                        }
+
+                                        let _ = data_exchange_with_stats(
+                                            client_conn,
+                                            target_conn,
+                                            read_timeout,
+                                            16384,
+                                            Some(stats.tcp_rx.clone()),
+                                            Some(stats.tcp_tx.clone()),
+                                            rate_limiter,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                stats.release_slot(false);
+                            });
                         }
-                        stats.release_slot(false);
-                    });
+                        Err(_e) => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
                 }
-                Err(_e) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                 }
             }
         }
@@ -424,7 +440,7 @@ impl TunnelClient {
                                 if !is_verified_udp.load(Ordering::SeqCst) {
                                     continue;
                                 }
-                                if let Some(session_tx) = sessions.get(&client_addr) {
+                                if let Some(session_tx) = sessions.get_active(&client_addr) {
                                     stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
                                     let _ = session_tx.try_send(buf[..n].to_vec());
                                 } else {
@@ -442,27 +458,39 @@ impl TunnelClient {
                                         let udp_sock_clone = Arc::clone(&udp_sock);
                                         let sessions_clone = sessions.clone();
                                         let stats_clone = stats_udp.clone();
+                                        let stats_reader = stats_clone.clone();
 
                                         tokio::spawn(async move {
                                             let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
+                                            let last_active = Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+                                            let last_active_writer = Arc::clone(&last_active);
+                                            let last_active_reader = Arc::clone(&last_active);
 
-                                            let writer_task = async {
+                                            let writer_task = async move {
                                                 while let Some(data) = rx.recv().await {
+                                                    *last_active_writer.lock() = std::time::Instant::now();
                                                     if write_udp_frame(&mut w_stream, &data).await.is_err() {
                                                         break;
                                                     }
                                                 }
                                             };
 
-                                            let reader_task = async {
+                                            let reader_task = async move {
                                                 let mut resp_buf = [0u8; 65535];
                                                 loop {
                                                     match read_udp_frame(&mut r_stream, &mut resp_buf, UDP_READ_TIMEOUT).await {
                                                         Ok(m) if m > 0 => {
-                                                            stats_clone.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
+                                                            *last_active_reader.lock() = std::time::Instant::now();
+                                                            stats_reader.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
                                                             let _ = udp_sock_clone.send_to(&resp_buf[..m], client_addr).await;
                                                         }
-                                                        _ => break,
+                                                        Ok(_) => break,
+                                                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                                            if last_active_reader.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                                break;
+                                                            }
+                                                        }
+                                                        Err(_) => break,
                                                     }
                                                 }
                                             };
@@ -491,8 +519,24 @@ impl TunnelClient {
         let proxy_enabled = cfg.proxy_protocol == "1";
         let read_timeout = cfg.read_timeout;
         let rate_limiter = self.rate_limiter.clone();
-
-        while let Some(signal) = control_loop.recv_signal().await {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        loop {
+            let signal = tokio::select! {
+                res = control_loop.recv_signal() => {
+                    match res {
+                        Some(s) => s,
+                        None => break,
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Tunnel client shutdown triggered");
+                        control_loop.stop();
+                        break;
+                    }
+                    continue;
+                }
+            };
             match signal.action_type.as_str() {
                 "tcp" => {
                     if !is_verified.load(Ordering::SeqCst) {
@@ -560,31 +604,48 @@ impl TunnelClient {
                                                 let stats_t = stats.clone();
 
                                                 let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
+                                                let last_active = Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+                                                let last_active_task1 = Arc::clone(&last_active);
+                                                let last_active_task2 = Arc::clone(&last_active);
 
-                                                let task1 = async {
+                                                let task1 = async move {
                                                     let mut buf = [0u8; 65535];
                                                     loop {
                                                         match read_udp_frame(&mut r_stream, &mut buf, UDP_READ_TIMEOUT).await {
                                                             Ok(n) if n > 0 => {
+                                                                *last_active_task1.lock() = std::time::Instant::now();
                                                                 stats_t.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
                                                                 let _ = target_sock.send(&buf[..n]).await;
                                                             }
-                                                            _ => break,
+                                                            Ok(_) => break,
+                                                            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                                                if last_active_task1.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                                    break;
+                                                                }
+                                                            }
+                                                            Err(_) => break,
                                                         }
                                                     }
                                                 };
 
-                                                let task2 = async {
+                                                let task2 = async move {
                                                     let mut buf = [0u8; 65535];
                                                     loop {
                                                         match tokio::time::timeout(UDP_READ_TIMEOUT, target_sock_read.recv(&mut buf)).await {
                                                             Ok(Ok(n)) if n > 0 => {
+                                                                *last_active_task2.lock() = std::time::Instant::now();
                                                                 stats_t.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
                                                                 if write_udp_frame(&mut w_stream, &buf[..n]).await.is_err() {
                                                                     break;
                                                                 }
                                                             }
-                                                            _ => break,
+                                                            Ok(Ok(_)) => break,
+                                                            Ok(Err(_)) => break,
+                                                            Err(_) => {
+                                                                if last_active_task2.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                                    break;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 };

@@ -283,10 +283,35 @@ impl McpHandler {
                 let target_addr = args.get("target_address").and_then(|v| v.as_str()).unwrap_or("127.0.0.1");
                 let pwd = args.get("password").and_then(|v| v.as_str()).unwrap_or("");
 
-                let url_str = if pwd.is_empty() {
-                    format!("{}://{}:{}/{}:{}", inst_type, tunnel_addr, tunnel_port, target_addr, target_port)
+                let tunnel = if (tunnel_addr.contains(':') && !tunnel_addr.starts_with('[')) || tunnel_port.is_empty() {
+                    tunnel_addr.to_string()
                 } else {
-                    format!("{}://:{}@{}:{}/{}:{}", inst_type, pwd, tunnel_addr, tunnel_port, target_addr, target_port)
+                    format!("{}:{}", tunnel_addr, tunnel_port)
+                };
+
+                let target = if target_port.is_empty() {
+                    target_addr.to_string()
+                } else {
+                    format!("{}:{}", target_addr, target_port)
+                };
+
+                let dummy = format!("{}://{}", inst_type, tunnel);
+                let url_str = match url::Url::parse(&dummy) {
+                    Ok(mut u) => {
+                        if !pwd.is_empty() {
+                            let _ = u.set_password(Some(pwd));
+                        }
+                        let path = if target.starts_with('/') { target } else { format!("/{}", target) };
+                        u.set_path(&path);
+                        u.to_string()
+                    }
+                    Err(_) => {
+                        if pwd.is_empty() {
+                            format!("{}://{}/{}", inst_type, tunnel, target)
+                        } else {
+                            format!("{}://:{}@{}/{}", inst_type, pwd, tunnel, target)
+                        }
+                    }
                 };
 
                 let new_id = format!("{:08x}", rand::random::<u32>());
@@ -306,6 +331,24 @@ impl McpHandler {
                 }
                 if let Some(restart) = args.get("restart").and_then(|v| v.as_bool()) {
                     inst.restart = restart;
+                }
+                if let Some(tags) = args.get("tags").and_then(|v| v.as_object()) {
+                    for (k, v) in tags {
+                        if let Some(s) = v.as_str() {
+                            inst.meta.tags.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+                if let Some(peer) = args.get("peer").and_then(|v| v.as_object()) {
+                    if let Some(alias) = peer.get("alias").and_then(|v| v.as_str()) {
+                        inst.meta.peer.alias = alias.to_string();
+                    }
+                    if let Some(peer_type) = peer.get("type").and_then(|v| v.as_str()) {
+                        inst.meta.peer.peer_type = peer_type.to_string();
+                    }
+                    if let Some(sid) = peer.get("sid").and_then(|v| v.as_str()) {
+                        inst.meta.peer.sid = sid.to_string();
+                    }
                 }
                 drop(inst);
                 let _ = self.state_mgr.save(&self.instances).await;
@@ -488,17 +531,17 @@ impl McpHandler {
                 let query_map: std::collections::HashMap<String, String> =
                     parsed_url.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
                 let path = parsed_url.path().trim_start_matches('/');
-                let mut target_addr = "";
-                let mut target_port = "";
-                if path.contains(':') {
-                    let parts: Vec<&str> = path.split(':').collect();
-                    target_addr = parts[0];
-                    if parts.len() > 1 { target_port = parts[1]; }
-                }
+                let first_target = path.split(',').next().unwrap_or("");
+                let (target_addr, target_port) = split_target_addr_port(first_target);
+                let pwd = if let Some(p) = parsed_url.password() {
+                    p
+                } else {
+                    parsed_url.username()
+                };
                 let config_json = json!({
                     "id": inst_id,
                     "type": parsed_url.scheme(),
-                    "password": parsed_url.password().unwrap_or(parsed_url.username()),
+                    "password": pwd,
                     "tunnel_address": parsed_url.host_str().unwrap_or_default(),
                     "tunnel_port": parsed_url.port().map(|p| p.to_string()).unwrap_or_default(),
                     "target_address": target_addr,
@@ -597,6 +640,23 @@ impl McpHandler {
     }
 }
 
+pub(crate) fn split_target_addr_port(target: &str) -> (&str, &str) {
+    let s = target.trim();
+    if s.starts_with('[') {
+        if let Some(close) = s.find(']') {
+            let addr = &s[..=close];
+            let rest = &s[close + 1..];
+            let port = rest.strip_prefix(':').unwrap_or("");
+            return (addr, port);
+        }
+    }
+    if let Some(pos) = s.rfind(':') {
+        (&s[..pos], &s[pos + 1..])
+    } else {
+        (s, "")
+    }
+}
+
 fn update_instance_url(inst: &mut Instance, updates: std::collections::HashMap<String, String>) -> Result<(), String> {
     let mut parsed_url = url::Url::parse(&inst.url).map_err(|e| format!("Invalid URL: {}", e))?;
 
@@ -624,16 +684,21 @@ fn update_instance_url(inst: &mut Instance, updates: std::collections::HashMap<S
         parsed_url.set_path(&path);
     } else if updates.contains_key("target_address") || updates.contains_key("target_port") {
         let current_path = parsed_url.path().trim_start_matches('/');
-        let mut cur_addr = "127.0.0.1";
-        let mut cur_port = "80";
-        if current_path.contains(':') {
-            let parts: Vec<&str> = current_path.split(':').collect();
-            cur_addr = parts[0];
-            if parts.len() > 1 { cur_port = parts[1]; }
-        }
+        let first_target = current_path.split(',').next().unwrap_or("");
+        let (cur_addr, cur_port) = split_target_addr_port(first_target);
+        let cur_addr = if cur_addr.is_empty() { "127.0.0.1" } else { cur_addr };
+        let cur_port = if cur_port.is_empty() { "80" } else { cur_port };
+
         let new_addr = updates.get("target_address").map(|s| s.as_str()).unwrap_or(cur_addr);
         let new_port = updates.get("target_port").map(|s| s.as_str()).unwrap_or(cur_port);
-        parsed_url.set_path(&format!("{}:{}", new_addr, new_port));
+        let formatted_target = if new_port.is_empty() {
+            new_addr.to_string()
+        } else {
+            format!("{}:{}", new_addr, new_port)
+        };
+        let remainder = current_path.split_once(',').map(|(_, r)| format!(",{}", r)).unwrap_or_default();
+        let full_path = format!("{}{}", formatted_target, remainder);
+        parsed_url.set_path(&if full_path.starts_with('/') { full_path } else { format!("/{}", full_path) });
     }
 
     let special_keys = [
@@ -732,5 +797,33 @@ mod tests {
         };
         let update_resp = handler.handle_request(update_req).await;
         assert!(update_resp.error.is_none());
+    }
+
+    #[test]
+    fn test_split_target_addr_port() {
+        assert_eq!(split_target_addr_port("127.0.0.1:80"), ("127.0.0.1", "80"));
+        assert_eq!(split_target_addr_port("[::1]:8080"), ("[::1]", "8080"));
+        assert_eq!(split_target_addr_port("[::1]"), ("[::1]", ""));
+        assert_eq!(split_target_addr_port("example.com:443"), ("example.com", "443"));
+        assert_eq!(split_target_addr_port("127.0.0.1"), ("127.0.0.1", ""));
+    }
+
+    #[test]
+    fn test_update_instance_url_ipv6() {
+        let mut inst = Instance::new(
+            "inst-1".to_string(),
+            "test".to_string(),
+            "client".to_string(),
+            "client://[::1]:8080/[::1]:8080".to_string(),
+        );
+        let mut updates = std::collections::HashMap::new();
+        updates.insert("target_port".to_string(), "9090".to_string());
+        update_instance_url(&mut inst, updates).unwrap();
+        assert_eq!(inst.url, "client://[::1]:8080/[::1]:9090");
+
+        let mut updates2 = std::collections::HashMap::new();
+        updates2.insert("target_address".to_string(), "127.0.0.1".to_string());
+        update_instance_url(&mut inst, updates2).unwrap();
+        assert_eq!(inst.url, "client://[::1]:8080/127.0.0.1:9090");
     }
 }

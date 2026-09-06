@@ -20,6 +20,7 @@ pub struct McpHandler {
 }
 
 impl McpHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instances: Arc<DashMap<String, Instance>>,
         process_mgr: Arc<ProcessManager>,
@@ -231,6 +232,17 @@ impl McpHandler {
                 "name": "get_master_info",
                 "description": "Get master information",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "update_master_info",
+                "description": "Update master alias (server name or label)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "alias": { "type": "string", "description": "New alias for master" }
+                    },
+                    "required": ["alias"]
+                }
             }
         ]);
 
@@ -370,6 +382,14 @@ impl McpHandler {
                 );
                 serde_json::to_string_pretty(&info).unwrap_or_default()
             }
+            "update_master_info" => {
+                let new_alias = args.get("alias").and_then(|v| v.as_str()).unwrap_or_default();
+                if new_alias.is_empty() {
+                    return MCPResponse::error(id, -32602, "alias is required", None);
+                }
+                *self.alias.write() = new_alias.to_string();
+                format!("Master alias updated to: {}", new_alias)
+            }
             _ => format!("Executed tool {}", tool_name),
         };
 
@@ -434,6 +454,21 @@ mod tests {
         let list_resp = handler.handle_request(list_req).await;
         assert!(list_resp.error.is_none());
         let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
+
+        // 3. Call update_master_info
+        let update_req = MCPRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "update_master_info",
+                "arguments": {
+                    "alias": "new-master-alias"
+                }
+            })),
+        };
+        let update_resp = handler.handle_request(update_req).await;
+        assert!(update_resp.error.is_none());
     }
 }

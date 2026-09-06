@@ -65,6 +65,7 @@ pub fn get_linux_sys_info() -> SystemInfo {
     info
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn get_master_info(
     mid: &str,
     alias: &str,

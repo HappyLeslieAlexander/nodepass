@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let url_str = if pwd.is_empty() {
                 format!("server://{}/{}?tls={}&type={}&mode={}", addr, target, s.tls, s.pool, s.mode)
             } else {
-                format!("server://:{}@{}/{}?tls={}&type={}&mode={}", pwd, addr, target, s.tls, s.pool, s.mode)
+                format!("server://{}@{}/{}?tls={}&type={}&mode={}", pwd, addr, target, s.tls, s.pool, s.mode)
             };
             run_url(&url_str).await
         }
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let url_str = if pwd.is_empty() {
                 format!("client://{}/{}?tls={}&type={}&mode={}", addr, target, c.tls, c.pool, c.mode)
             } else {
-                format!("client://:{}@{}/{}?tls={}&type={}&mode={}", pwd, addr, target, c.tls, c.pool, c.mode)
+                format!("client://{}@{}/{}?tls={}&type={}&mode={}", pwd, addr, target, c.tls, c.pool, c.mode)
             };
             run_url(&url_str).await
         }

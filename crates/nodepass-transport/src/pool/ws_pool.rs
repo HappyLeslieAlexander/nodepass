@@ -48,7 +48,6 @@ impl WsPool {
         let stop_flag = Arc::clone(&self.stop_flag);
 
         tokio::spawn(async move {
-            let mut is_first = true;
             while !stop_flag.load(Ordering::Relaxed) {
                 if let Ok((tcp_stream, _)) = listener.accept().await {
                     let tls_opt = tls_acceptor.clone();
@@ -57,9 +56,6 @@ impl WsPool {
                     let idle_tx = idle_tx.clone();
                     let active_count = Arc::clone(&active_count);
                     let is_ready = Arc::clone(&is_ready);
-
-                    let was_first = is_first;
-                    is_first = false;
 
                     tokio::spawn(async move {
                         let ws_stream = if let Some(ref acceptor) = tls_opt {
@@ -77,11 +73,13 @@ impl WsPool {
                             }
                         };
 
-                        if was_first {
-                            *control_stream.lock().await = Some(ws_stream);
+                        let mut cs = control_stream.lock().await;
+                        if cs.is_none() && !is_ready.load(Ordering::SeqCst) {
+                            *cs = Some(ws_stream);
                             is_ready.store(true, Ordering::SeqCst);
                             control_notify.notify_waiters();
                         } else {
+                            drop(cs);
                             active_count.fetch_add(1, Ordering::Relaxed);
                             let _ = idle_tx.send(ws_stream).await;
                         }

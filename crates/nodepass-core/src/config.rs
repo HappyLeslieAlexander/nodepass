@@ -96,6 +96,12 @@ impl TunnelConfig {
         // TunnelKey derivation
         let tunnel_key = if !url.username().is_empty() {
             url.username().to_string()
+        } else if let Some(pass) = url.password() {
+            if !pass.is_empty() {
+                pass.to_string()
+            } else {
+                fnv1a_32_hex(&port.to_string())
+            }
         } else {
             fnv1a_32_hex(&port.to_string())
         };
@@ -150,10 +156,8 @@ impl TunnelConfig {
                 "crt" => crt_path = Some(v.to_string()),
                 "key" => key_path = Some(v.to_string()),
                 "dial" => {
-                    if v != "auto" {
-                        if v.parse::<IpAddr>().is_ok() {
-                            dialer_ip = v.to_string();
-                        }
+                    if v != "auto" && v.parse::<IpAddr>().is_ok() {
+                        dialer_ip = v.to_string();
                     }
                 }
                 "read" => {
@@ -332,9 +336,9 @@ pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs == 0 {
         "0s".to_string()
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{}s", secs)
@@ -390,5 +394,12 @@ mod tests {
         let url = "server://0.0.0.0:10101/127.0.0.1:8080?type=1&tls=0";
         let cfg = TunnelConfig::parse(url).unwrap();
         assert_eq!(cfg.tls_code, "1"); // upgraded from 0 to 1
+    }
+
+    #[test]
+    fn test_parse_client_with_password_only() {
+        let url = "client://:secretpass@server.com:10101/10.0.0.1:80";
+        let cfg = TunnelConfig::parse(url).unwrap();
+        assert_eq!(cfg.tunnel_key, "secretpass");
     }
 }

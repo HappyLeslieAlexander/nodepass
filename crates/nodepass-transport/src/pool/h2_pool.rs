@@ -86,12 +86,16 @@ impl H2Pool {
         });
     }
 
-    /// Starts H2 pool client on an underlying stream.
-    pub fn start_client<S: crate::stream::AsyncStream>(&self, stream: S) {
+    /// Starts H2 pool client on an underlying stream, maintaining min_capacity idle streams.
+    pub fn start_client<S: crate::stream::AsyncStream>(&self, stream: S, min_capacity: usize) {
         let control_stream = Arc::clone(&self.control_stream);
         let control_notify = Arc::clone(&self.control_notify);
         let send_request = Arc::clone(&self.send_request);
         let is_ready = Arc::clone(&self.is_ready);
+        let stream_tx = self.stream_tx.clone();
+        let active_count = Arc::clone(&self.active_count);
+        let stop_flag = Arc::clone(&self.stop_flag);
+        let min_capacity = min_capacity.max(2);
 
         tokio::spawn(async move {
             let (mut client, conn) = match h2::client::handshake(stream).await {
@@ -108,6 +112,9 @@ impl H2Pool {
             let req = Request::builder().uri("/").body(()).unwrap();
             match client.send_request(req, false) {
                 Ok((res_future, send)) => {
+                    let control_stream = Arc::clone(&control_stream);
+                    let control_notify = Arc::clone(&control_notify);
+                    let is_ready = Arc::clone(&is_ready);
                     tokio::spawn(async move {
                         if let Ok(res) = res_future.await {
                             let recv = res.into_body();
@@ -121,7 +128,35 @@ impl H2Pool {
                 Err(_) => return,
             }
 
-            *send_request.lock().await = Some(client);
+            *send_request.lock().await = Some(client.clone());
+
+            // Pool expansion loop
+            while !stop_flag.load(Ordering::Relaxed) {
+                let current = active_count.load(Ordering::Relaxed);
+                if current < min_capacity {
+                    let mut ready_client = match client.clone().ready().await {
+                        Ok(c) => c,
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let req = Request::builder().uri("/data").body(()).unwrap();
+                    if let Ok((res_future, send)) = ready_client.send_request(req, false) {
+                        let stream_tx = stream_tx.clone();
+                        let active_count = Arc::clone(&active_count);
+                        tokio::spawn(async move {
+                            if let Ok(res) = res_future.await {
+                                let recv = res.into_body();
+                                let boxed = box_stream(H2Stream::new(send, recv));
+                                active_count.fetch_add(1, Ordering::Relaxed);
+                                let _ = stream_tx.send(boxed).await;
+                            }
+                        });
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         });
     }
 }
@@ -129,35 +164,15 @@ impl H2Pool {
 #[async_trait]
 impl TransportPool for H2Pool {
     async fn incoming_get(&self, timeout: Duration) -> Result<(String, BoxedStream), PoolError> {
-        let client_opt = self.send_request.lock().await.clone();
-        if let Some(client) = client_opt {
-            let req = Request::builder().uri("/data").body(()).unwrap();
-            let mut ready_client = match tokio::time::timeout(timeout, client.ready()).await {
-                Ok(Ok(c)) => c,
-                _ => return Err(PoolError::Timeout),
-            };
-            match ready_client.send_request(req, false) {
-                Ok((res_future, send)) => match tokio::time::timeout(timeout, res_future).await {
-                    Ok(Ok(res)) => {
-                        let recv = res.into_body();
-                        let id = format!("{:08x}", rand::random::<u32>());
-                        Ok((id, box_stream(H2Stream::new(send, recv))))
-                    }
-                    _ => Err(PoolError::Timeout),
-                },
-                Err(e) => Err(PoolError::Other(e.to_string())),
+        let mut rx = self.stream_rx.lock().await;
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(stream)) => {
+                let id = format!("{:08x}", rand::random::<u32>());
+                self.active_count.fetch_sub(1, Ordering::Relaxed);
+                Ok((id, stream))
             }
-        } else {
-            let mut rx = self.stream_rx.lock().await;
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(stream)) => {
-                    let id = format!("{:08x}", rand::random::<u32>());
-                    self.active_count.fetch_sub(1, Ordering::Relaxed);
-                    Ok((id, stream))
-                }
-                Ok(None) => Err(PoolError::Closed),
-                Err(_) => Err(PoolError::Timeout),
-            }
+            Ok(None) => Err(PoolError::Closed),
+            Err(_) => Err(PoolError::Timeout),
         }
     }
 
@@ -179,42 +194,14 @@ impl TransportPool for H2Pool {
             }
         }
 
-        // Try pre-buffered stream first
-        {
-            let mut rx = self.stream_rx.lock().await;
-            if let Ok(stream) = rx.try_recv() {
+        let mut rx = self.stream_rx.lock().await;
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(stream)) => {
                 self.active_count.fetch_sub(1, Ordering::Relaxed);
-                return Ok(stream);
+                Ok(stream)
             }
-        }
-
-        let client_opt = self.send_request.lock().await.clone();
-        if let Some(client) = client_opt {
-            let req = Request::builder().uri("/data").body(()).unwrap();
-            let mut ready_client = match tokio::time::timeout(timeout, client.ready()).await {
-                Ok(Ok(c)) => c,
-                _ => return Err(PoolError::Timeout),
-            };
-            match ready_client.send_request(req, false) {
-                Ok((res_future, send)) => match tokio::time::timeout(timeout, res_future).await {
-                    Ok(Ok(res)) => {
-                        let recv = res.into_body();
-                        Ok(box_stream(H2Stream::new(send, recv)))
-                    }
-                    _ => Err(PoolError::Timeout),
-                },
-                Err(e) => Err(PoolError::Other(e.to_string())),
-            }
-        } else {
-            let mut rx = self.stream_rx.lock().await;
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(stream)) => {
-                    self.active_count.fetch_sub(1, Ordering::Relaxed);
-                    Ok(stream)
-                }
-                Ok(None) => Err(PoolError::Closed),
-                Err(_) => Err(PoolError::Timeout),
-            }
+            Ok(None) => Err(PoolError::Closed),
+            Err(_) => Err(PoolError::Timeout),
         }
     }
 

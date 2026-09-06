@@ -78,7 +78,10 @@ where
             Poll::Ready(Ok(())) => {
                 let msg = Message::Binary(buf.to_vec());
                 match Pin::new(&mut self.inner).start_send(msg) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Ok(()) => {
+                        let _ = Pin::new(&mut self.inner).poll_flush(cx);
+                        Poll::Ready(Ok(buf.len()))
+                    }
                     Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
                 }
             }

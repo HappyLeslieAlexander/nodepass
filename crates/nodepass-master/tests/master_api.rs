@@ -168,5 +168,5 @@ async fn test_mcp_api_via_http() {
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let resp_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     let tools = resp_json["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18);
+    assert_eq!(tools.len(), 19);
 }

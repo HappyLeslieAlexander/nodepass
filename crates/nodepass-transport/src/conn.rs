@@ -29,6 +29,18 @@ impl<S: AsyncStream> StatStream<S> {
             rate,
         }
     }
+
+    pub fn rx(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.rx)
+    }
+
+    pub fn tx(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.tx)
+    }
+
+    pub fn rate(&self) -> Option<&RateLimiter> {
+        self.rate.as_ref()
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for StatStream<S> {

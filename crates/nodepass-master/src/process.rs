@@ -84,47 +84,53 @@ impl ProcessManager {
         let stderr = child.stderr.take();
 
         tokio::spawn(async move {
-            let mut stdout_reader = stdout.map(|s| BufReader::new(s).lines());
-            let mut stderr_reader = stderr.map(|s| BufReader::new(s).lines());
+            let instances_for_stdout = Arc::clone(&instances_clone);
+            let event_tx_for_stdout = event_tx_clone.clone();
+            let re_for_stdout = re.clone();
+            let id_for_stdout = instance_id.clone();
 
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => {
-                        let _ = child.kill().await;
-                        break;
+            if let Some(out) = stdout {
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(out).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        Self::process_log_line(
+                            &id_for_stdout,
+                            &line,
+                            &instances_for_stdout,
+                            &event_tx_for_stdout,
+                            &re_for_stdout,
+                        );
                     }
-                    line_res = async {
-                        if let Some(ref mut reader) = stdout_reader {
-                            reader.next_line().await
-                        } else {
-                            futures_util::future::pending().await
-                        }
-                    } => {
-                        match line_res {
-                            Ok(Some(line)) => {
-                                Self::process_log_line(&instance_id, &line, &instances_clone, &event_tx_clone, &re);
-                            }
-                            _ => break,
-                        }
+                });
+            }
+
+            let instances_for_stderr = Arc::clone(&instances_clone);
+            let event_tx_for_stderr = event_tx_clone.clone();
+            let re_for_stderr = re.clone();
+            let id_for_stderr = instance_id.clone();
+
+            if let Some(err) = stderr {
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(err).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        Self::process_log_line(
+                            &id_for_stderr,
+                            &line,
+                            &instances_for_stderr,
+                            &event_tx_for_stderr,
+                            &re_for_stderr,
+                        );
                     }
-                    err_res = async {
-                        if let Some(ref mut reader) = stderr_reader {
-                            reader.next_line().await
-                        } else {
-                            futures_util::future::pending().await
-                        }
-                    } => {
-                        match err_res {
-                            Ok(Some(line)) => {
-                                Self::process_log_line(&instance_id, &line, &instances_clone, &event_tx_clone, &re);
-                            }
-                            _ => break,
-                        }
-                    }
-                    status = child.wait() => {
-                        debug!("Instance {} child exited: {:?}", instance_id, status);
-                        break;
-                    }
+                });
+            }
+
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+                status = child.wait() => {
+                    debug!("Instance {} child exited: {:?}", instance_id, status);
                 }
             }
 

@@ -15,10 +15,29 @@ where
     S1: AsyncStream,
     S2: AsyncStream,
 {
+    data_exchange_with_stats(s1, s2, idle_timeout, buf_size, None, None, None).await
+}
+
+/// Bidirectional data pump with traffic accounting (rx/tx atomic counters) and token-bucket rate limiting.
+pub async fn data_exchange_with_stats<S1, S2>(
+    s1: S1,
+    s2: S2,
+    idle_timeout: Duration,
+    buf_size: usize,
+    rx: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    tx: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    rate: Option<nodepass_transport::rate::RateLimiter>,
+) -> io::Result<()>
+where
+    S1: AsyncStream,
+    S2: AsyncStream,
+{
     let (mut r1, mut w1) = tokio::io::split(s1);
     let (mut r2, mut w2) = tokio::io::split(s2);
 
-    let pump1 = async {
+    let rx_clone = rx;
+    let rate_clone = rate.clone();
+    let pump1 = async move {
         let mut buf = vec![0u8; buf_size];
         loop {
             let read_fut = r1.read(&mut buf);
@@ -43,12 +62,21 @@ where
                 }
                 break;
             }
+
+            if let Some(ref rx_cnt) = rx_clone {
+                rx_cnt.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(ref r_limit) = rate_clone {
+                r_limit.wait_read(n).await;
+            }
+
             w2.write_all(&buf[..n]).await?;
+            w2.flush().await?;
         }
         Ok::<(), io::Error>(())
     };
 
-    let pump2 = async {
+    let pump2 = async move {
         let mut buf = vec![0u8; buf_size];
         loop {
             let read_fut = r2.read(&mut buf);
@@ -73,7 +101,16 @@ where
                 }
                 break;
             }
+
+            if let Some(ref tx_cnt) = tx {
+                tx_cnt.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(ref r_limit) = rate {
+                r_limit.wait_write(n).await;
+            }
+
             w1.write_all(&buf[..n]).await?;
+            w1.flush().await?;
         }
         Ok::<(), io::Error>(())
     };

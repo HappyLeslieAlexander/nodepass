@@ -74,7 +74,7 @@ impl RateLimiter {
                 // Not enough tokens: compute wait duration
                 let needed = bytes - curr;
                 let wait_secs = (needed as f64) / (max_rate as f64);
-                let wait_duration = Duration::from_secs_f64(wait_secs.max(0.001).min(1.0));
+                let wait_duration = Duration::from_secs_f64(wait_secs.clamp(0.001, 1.0));
                 tokio::time::sleep(wait_duration).await;
             }
         }

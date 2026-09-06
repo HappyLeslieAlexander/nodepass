@@ -42,6 +42,10 @@ impl UdpSessionManager {
         mgr
     }
 
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     pub fn get(&self, addr: &SocketAddr) -> Option<UdpSession> {
         self.sessions.get(addr).map(|entry| {
             let session = entry.value();

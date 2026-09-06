@@ -1,23 +1,29 @@
 use crate::control::ControlLoop;
-use crate::exchange::data_exchange;
+use crate::exchange::data_exchange_with_stats;
+use dashmap::DashMap;
 use nodepass_core::address::{DnsCache, TargetSelector};
-use nodepass_core::config::{TunnelConfig, POOL_GET_TIMEOUT, REPORT_INTERVAL};
+use nodepass_core::config::{
+    TunnelConfig, POOL_GET_TIMEOUT, REPORT_INTERVAL, UDP_READ_TIMEOUT,
+};
 use nodepass_core::crypto::{
     create_mode1_client_tls_config, generate_auth_token,
 };
 use nodepass_core::protocol::{detect_block_protocol, format_proxy_v1_header, Signal};
+use nodepass_transport::framed::{read_udp_frame, write_udp_frame};
 use nodepass_transport::pool::{
-    QuicPool, TcpPool, TransportPool, WsPool,
+    H2Pool, QuicPool, TcpPool, TransportPool, WsPool,
 };
 use nodepass_transport::rate::RateLimiter;
 use nodepass_transport::stats::Stats;
+use nodepass_transport::stream::BoxedStream;
 use serde::Deserialize;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
@@ -93,6 +99,93 @@ impl TunnelClient {
         let block_socks = config.block_socks;
         let block_http = config.block_http;
         let block_tls = config.block_tls;
+        let rate_limiter = self.rate_limiter.clone();
+
+        // Single mode UDP support
+        if !config.disable_udp {
+            let tunnel_addr = config.tunnel_addr.clone();
+            let selector_udp = Arc::clone(&self.selector);
+            let stats_udp = self.stats.clone();
+            let stop_flag_udp = Arc::clone(&self.stop_flag);
+            let rate_limiter_udp = self.rate_limiter.clone();
+
+            tokio::spawn(async move {
+                if let Ok(udp_sock) = UdpSocket::bind(&tunnel_addr).await {
+                    let udp_sock = Arc::new(udp_sock);
+                    let session_map: Arc<DashMap<SocketAddr, Arc<UdpSocket>>> =
+                        Arc::new(DashMap::new());
+
+                    let mut buf = [0u8; 65535];
+                    while !stop_flag_udp.load(Ordering::Relaxed) {
+                        match udp_sock.recv_from(&mut buf).await {
+                            Ok((n, client_addr)) => {
+                                if let Some(target_sock) = session_map.get(&client_addr) {
+                                    stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                                    if let Some(ref r) = rate_limiter_udp {
+                                        r.wait_read(n).await;
+                                    }
+                                    let _ = target_sock.send(&buf[..n]).await;
+                                } else {
+                                    if !stats_udp.try_acquire_slot(true) {
+                                        continue;
+                                    }
+                                    if let Ok((_, target_addr)) = selector_udp.select_next().await {
+                                        if let Ok(target_sock) = UdpSocket::bind("0.0.0.0:0").await {
+                                            if target_sock.connect(target_addr).await.is_ok() {
+                                                let target_sock = Arc::new(target_sock);
+                                                session_map.insert(client_addr, Arc::clone(&target_sock));
+
+                                                stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                                                if let Some(ref r) = rate_limiter_udp {
+                                                    r.wait_read(n).await;
+                                                }
+                                                let _ = target_sock.send(&buf[..n]).await;
+
+                                                let udp_sock_clone = Arc::clone(&udp_sock);
+                                                let session_map_clone = Arc::clone(&session_map);
+                                                let target_sock_clone = Arc::clone(&target_sock);
+                                                let stats_clone = stats_udp.clone();
+                                                let rate_clone = rate_limiter_udp.clone();
+
+                                                tokio::spawn(async move {
+                                                    let mut resp_buf = [0u8; 65535];
+                                                    loop {
+                                                        match tokio::time::timeout(
+                                                            UDP_READ_TIMEOUT,
+                                                            target_sock_clone.recv(&mut resp_buf),
+                                                        ).await {
+                                                            Ok(Ok(m)) if m > 0 => {
+                                                                stats_clone.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
+                                                                if let Some(ref r) = rate_clone {
+                                                                    r.wait_write(m).await;
+                                                                }
+                                                                let _ = udp_sock_clone.send_to(&resp_buf[..m], client_addr).await;
+                                                            }
+                                                            _ => break,
+                                                        }
+                                                    }
+                                                    session_map_clone.remove(&client_addr);
+                                                    stats_clone.release_slot(true);
+                                                });
+                                            } else {
+                                                stats_udp.release_slot(true);
+                                            }
+                                        } else {
+                                            stats_udp.release_slot(true);
+                                        }
+                                    } else {
+                                        stats_udp.release_slot(true);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         while !self.stop_flag.load(Ordering::Relaxed) {
             match listener.accept().await {
@@ -104,6 +197,7 @@ impl TunnelClient {
 
                     let selector = Arc::clone(&selector);
                     let stats = stats.clone();
+                    let rate_limiter = rate_limiter.clone();
                     tokio::spawn(async move {
                         // Protocol peek
                         let mut peek_buf = [0u8; 8];
@@ -132,11 +226,14 @@ impl TunnelClient {
                                     .await;
                                 }
 
-                                let _ = data_exchange(
+                                let _ = data_exchange_with_stats(
                                     client_conn,
                                     target_conn,
                                     read_timeout,
                                     16384,
+                                    Some(stats.tcp_rx.clone()),
+                                    Some(stats.tcp_tx.clone()),
+                                    rate_limiter,
                                 )
                                 .await;
                             }
@@ -198,6 +295,30 @@ impl TunnelClient {
                 ws_pool.start_client(server_addr, ws_url, cfg.min_pool_capacity, tls_connector);
                 ws_pool
             }
+            "3" => {
+                // HTTP/2 pool
+                let h2_pool = Arc::new(H2Pool::new(cfg.max_pool_capacity));
+                let server_addr = self.dns_cache.resolve(&cfg.tunnel_addr).await?;
+                let tcp_stream = TcpStream::connect(server_addr).await?;
+                let h2_pool_clone = Arc::clone(&h2_pool);
+                let tls_connector = if cfg.tls_code != "0" {
+                    let mut tls_cfg = create_mode1_client_tls_config(Arc::clone(&recorded_fp));
+                    tls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+                    let connector = TlsConnector::from(Arc::new(tls_cfg));
+                    let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap().to_owned();
+                    Some((connector, name))
+                } else {
+                    None
+                };
+
+                if let Some((connector, name)) = tls_connector {
+                    let tls_stream = connector.connect(name, tcp_stream).await?;
+                    h2_pool_clone.start_client(tls_stream, cfg.min_pool_capacity);
+                } else {
+                    h2_pool_clone.start_client(tcp_stream, cfg.min_pool_capacity);
+                }
+                h2_pool
+            }
             _ => {
                 // TCP pool (type 0)
                 let (tcp_pool, _) = TcpPool::new(cfg.max_pool_capacity);
@@ -232,20 +353,103 @@ impl TunnelClient {
             let pool_clone = Arc::clone(&pool);
             let control_tx = control_loop.sender();
             let cfg_clone = cfg.clone();
+            let stats_clone = self.stats.clone();
+            let rate_limiter_clone = self.rate_limiter.clone();
+
             tokio::spawn(async move {
                 if let Some(target) = cfg_clone.target_addrs.first() {
                     if let Ok(listener) = TcpListener::bind(target).await {
                         while let Ok((target_conn, remote_addr)) = listener.accept().await {
+                            if !stats_clone.try_acquire_slot(false) {
+                                warn!("TCP slot limit reached");
+                                continue;
+                            }
                             if let Ok((id, pool_conn)) = pool_clone.incoming_get(POOL_GET_TIMEOUT).await {
                                 let _ = control_tx.send(Signal::tcp(remote_addr.to_string(), id)).await;
+                                let stats = stats_clone.clone();
+                                let rate_limit = rate_limiter_clone.clone();
                                 tokio::spawn(async move {
-                                    let _ = data_exchange(target_conn, pool_conn, cfg_clone.read_timeout, 16384).await;
+                                    let _ = data_exchange_with_stats(
+                                        target_conn,
+                                        pool_conn,
+                                        cfg_clone.read_timeout,
+                                        16384,
+                                        Some(stats.tcp_rx.clone()),
+                                        Some(stats.tcp_tx.clone()),
+                                        rate_limit,
+                                    ).await;
+                                    stats.release_slot(false);
                                 });
+                            } else {
+                                stats_clone.release_slot(false);
                             }
                         }
                     }
                 }
             });
+
+            // Pooled mode UDP listener when data_flow == "+"
+            if !cfg.disable_udp {
+                let pool_udp = Arc::clone(&pool);
+                let control_tx_udp = control_loop.sender();
+                let cfg_udp = cfg.clone();
+                let stats_udp = self.stats.clone();
+
+                tokio::spawn(async move {
+                    if let Some(target) = cfg_udp.target_addrs.first() {
+                        if let Ok(udp_sock) = UdpSocket::bind(target).await {
+                            let udp_sock = Arc::new(udp_sock);
+                            let sessions: Arc<DashMap<SocketAddr, Arc<Mutex<BoxedStream>>>> =
+                                Arc::new(DashMap::new());
+
+                            let mut buf = [0u8; 65535];
+                            while let Ok((n, client_addr)) = udp_sock.recv_from(&mut buf).await {
+                                if let Some(session_stream) = sessions.get(&client_addr) {
+                                    stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                                    let mut lock = session_stream.lock().await;
+                                    let _ = write_udp_frame(&mut *lock, &buf[..n]).await;
+                                } else {
+                                    if !stats_udp.try_acquire_slot(true) {
+                                        continue;
+                                    }
+                                    if let Ok((id, pool_conn)) = pool_udp.incoming_get(POOL_GET_TIMEOUT).await {
+                                        let _ = control_tx_udp.send(Signal::udp(client_addr.to_string(), id)).await;
+                                        let stream_arc = Arc::new(Mutex::new(pool_conn));
+                                        sessions.insert(client_addr, Arc::clone(&stream_arc));
+
+                                        stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                                        let mut lock = stream_arc.lock().await;
+                                        let _ = write_udp_frame(&mut *lock, &buf[..n]).await;
+                                        drop(lock);
+
+                                        let udp_sock_clone = Arc::clone(&udp_sock);
+                                        let sessions_clone = Arc::clone(&sessions);
+                                        let stats_clone = stats_udp.clone();
+
+                                        tokio::spawn(async move {
+                                            let mut resp_buf = [0u8; 65535];
+                                            loop {
+                                                let mut lock = stream_arc.lock().await;
+                                                match read_udp_frame(&mut *lock, &mut resp_buf, UDP_READ_TIMEOUT).await {
+                                                    Ok(m) if m > 0 => {
+                                                        stats_clone.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
+                                                        let _ = udp_sock_clone.send_to(&resp_buf[..m], client_addr).await;
+                                                    }
+                                                    _ => break,
+                                                }
+                                            }
+                                            sessions_clone.remove(&client_addr);
+                                            stats_clone.release_slot(true);
+                                        });
+                                    } else {
+                                        stats_udp.release_slot(true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
         }
 
         // 6. Signal dispatcher loop
@@ -253,6 +457,7 @@ impl TunnelClient {
         let stats = self.stats.clone();
         let proxy_enabled = cfg.proxy_protocol == "1";
         let read_timeout = cfg.read_timeout;
+        let rate_limiter = self.rate_limiter.clone();
 
         while let Some(signal) = control_loop.recv_signal().await {
             match signal.action_type.as_str() {
@@ -261,6 +466,7 @@ impl TunnelClient {
                         let pool_clone = Arc::clone(&pool);
                         let selector = Arc::clone(&selector);
                         let stats = stats.clone();
+                        let rate_limiter = rate_limiter.clone();
                         let remote_addr_str = signal.remote_addr.unwrap_or_default();
 
                         tokio::spawn(async move {
@@ -278,15 +484,78 @@ impl TunnelClient {
                                                 }
                                             }
 
-                                            let _ = data_exchange(
+                                            let _ = data_exchange_with_stats(
                                                 pool_conn,
                                                 target_conn,
                                                 read_timeout,
                                                 16384,
+                                                Some(stats.tcp_rx.clone()),
+                                                Some(stats.tcp_tx.clone()),
+                                                rate_limiter,
                                             ).await;
                                         }
                                     }
                                     stats.release_slot(false);
+                                }
+                            }
+                        });
+                    }
+                }
+                "udp" => {
+                    // Pooled mode UDP: when data_flow == "-", server received UDP datagram and requested client to dial target UDP
+                    if let Some(id) = signal.pool_conn_id {
+                        let pool_clone = Arc::clone(&pool);
+                        let selector = Arc::clone(&selector);
+                        let stats = stats.clone();
+
+                        tokio::spawn(async move {
+                            if let Ok(pool_conn) = pool_clone.outgoing_get(&id, POOL_GET_TIMEOUT).await {
+                                if stats.try_acquire_slot(true) {
+                                    if let Ok((_, target_addr)) = selector.select_next().await {
+                                        if let Ok(target_sock) = UdpSocket::bind("0.0.0.0:0").await {
+                                            if target_sock.connect(target_addr).await.is_ok() {
+                                                let target_sock = Arc::new(target_sock);
+                                                let target_sock_read = Arc::clone(&target_sock);
+                                                let stats_t = stats.clone();
+
+                                                let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
+
+                                                let task1 = async {
+                                                    let mut buf = [0u8; 65535];
+                                                    loop {
+                                                        match read_udp_frame(&mut r_stream, &mut buf, UDP_READ_TIMEOUT).await {
+                                                            Ok(n) if n > 0 => {
+                                                                stats_t.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                                                                let _ = target_sock.send(&buf[..n]).await;
+                                                            }
+                                                            _ => break,
+                                                        }
+                                                    }
+                                                };
+
+                                                let task2 = async {
+                                                    let mut buf = [0u8; 65535];
+                                                    loop {
+                                                        match tokio::time::timeout(UDP_READ_TIMEOUT, target_sock_read.recv(&mut buf)).await {
+                                                            Ok(Ok(n)) if n > 0 => {
+                                                                stats_t.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
+                                                                if write_udp_frame(&mut w_stream, &buf[..n]).await.is_err() {
+                                                                    break;
+                                                                }
+                                                            }
+                                                            _ => break,
+                                                        }
+                                                    }
+                                                };
+
+                                                tokio::select! {
+                                                    _ = task1 => {}
+                                                    _ = task2 => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    stats.release_slot(true);
                                 }
                             }
                         });
@@ -304,8 +573,15 @@ impl TunnelClient {
                     );
                 }
                 "verify" => {
-                    // Mode 1 fingerprint check
+                    // TLS Mode 1 fingerprint check: compare received fingerprint with recorded cert
                     if let Some(ref fp) = signal.fingerprint {
+                        let recorded = recorded_fp.lock().clone();
+                        if let Some(ref expected_fp) = recorded {
+                            if fp != expected_fp {
+                                warn!("TLS code-1: fingerprint mismatch: expected {} but got {}", expected_fp, fp);
+                                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "TLS fingerprint mismatch"));
+                            }
+                        }
                         info!("TLS code-1: RAM cert verified with sha256 fingerprint: {}", fp);
                     }
                 }

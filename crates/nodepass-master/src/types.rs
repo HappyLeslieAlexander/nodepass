@@ -144,7 +144,7 @@ pub struct InstanceEvent {
     pub logs: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
     pub cpu: i32,
     pub mem_total: u64,
@@ -156,6 +156,23 @@ pub struct SystemInfo {
     pub diskr: u64,
     pub diskw: u64,
     pub sysup: u64,
+}
+
+impl Default for SystemInfo {
+    fn default() -> Self {
+        Self {
+            cpu: -1,
+            mem_total: 0,
+            mem_used: 0,
+            swap_total: 0,
+            swap_used: 0,
+            netrx: 0,
+            nettx: 0,
+            diskr: 0,
+            diskw: 0,
+            sysup: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,4 +234,11 @@ impl MCPResponse {
             }),
         }
     }
+}
+
+pub fn now_timestamp_string() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}", d.as_secs())
 }

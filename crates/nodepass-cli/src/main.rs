@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Master(m)) => {
             init_logger(&m.log);
-            run_master(&m.listen, m.api_key.as_deref(), &m.prefix).await
+            run_master(&m.listen, m.api_key.as_deref(), &m.prefix, Some(m.log), None, None, None).await
         }
         None => {
             if !cli.raw_args.is_empty() && cli.raw_args[0].contains("://") {
@@ -226,10 +226,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     let parsed_url = Url::parse(url_str)?;
-    let log_level = parsed_url.query_pairs().find(|(k, _)| k == "log").map(|(_, v)| v.to_string()).unwrap_or_else(|| "info".to_string());
-    init_logger(&log_level);
-
     let config = TunnelConfig::parse(url_str)?;
+    init_logger(&config.log_level);
 
     match parsed_url.scheme() {
         "client" => {
@@ -293,7 +291,20 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            run_master(&listen, key, prefix).await?;
+            let mut log_level = None;
+            let mut tls_code = None;
+            let mut crt_path = None;
+            let mut key_path = None;
+            for (k, v) in parsed_url.query_pairs() {
+                match k.as_ref() {
+                    "log" => log_level = Some(v.to_string()),
+                    "tls" => tls_code = Some(v.to_string()),
+                    "crt" => crt_path = Some(v.to_string()),
+                    "key" => key_path = Some(v.to_string()),
+                    _ => {}
+                }
+            }
+            run_master(&listen, key, prefix, log_level, tls_code, crt_path, key_path).await?;
         }
         _ => {
             return Err(format!("Unknown scheme: {}", parsed_url.scheme()).into());
@@ -303,7 +314,15 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_master(listen_addr: &str, api_key_opt: Option<&str>, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_master(
+    listen_addr: &str,
+    api_key_opt: Option<&str>,
+    prefix: &str,
+    log_level: Option<String>,
+    tls_code: Option<String>,
+    crt_path: Option<String>,
+    key_path: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr: SocketAddr = listen_addr.parse()?;
     let instances = Arc::new(DashMap::new());
     let (event_tx, _) = tokio::sync::broadcast::channel(1024);
@@ -342,6 +361,10 @@ async fn run_master(listen_addr: &str, api_key_opt: Option<&str>, prefix: &str) 
         alias: "nodepass-master".to_string(),
         hostname: "localhost".to_string(),
         start_time: Instant::now(),
+        log_level,
+        tls_code,
+        crt_path,
+        key_path,
     };
 
     let router = create_router(state);

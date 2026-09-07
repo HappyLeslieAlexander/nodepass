@@ -48,9 +48,10 @@ impl TunnelServer {
         ));
         let rate_limiter = RateLimiter::new(config.rate_limit, config.rate_limit);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let slot_limit = config.slot_limit.max(1);
         Self {
             config: Arc::new(parking_lot::RwLock::new(config)),
-            stats: Stats::new(65536),
+            stats: Stats::new(slot_limit),
             dns_cache,
             selector,
             rate_limiter,
@@ -61,11 +62,53 @@ impl TunnelServer {
     }
 
     pub fn stop(&self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
+        self.stop_flag.store(true, Ordering::Release);
         let _ = self.shutdown_tx.send(true);
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.stop_flag.load(Ordering::Acquire)
+    }
+
+    /// Auto-restart supervisor loop with SERVICE_COOLDOWN delay (H-1).
     pub async fn run(&self) -> io::Result<()> {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        while !self.stop_flag.load(Ordering::Acquire) {
+            if let Err(e) = self.start().await {
+                if self.stop_flag.load(Ordering::Acquire) || *shutdown_rx.borrow() {
+                    break;
+                }
+                let cooldown = nodepass_core::config::service_cooldown();
+                warn!("Tunnel server error: {}. Restarting in {:?}...", e, cooldown);
+                tokio::select! {
+                    _ = tokio::time::sleep(cooldown) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                if self.stop_flag.load(Ordering::Acquire) || *shutdown_rx.borrow() {
+                    break;
+                }
+                let cooldown = nodepass_core::config::service_cooldown();
+                warn!("Tunnel server finished unexpectedly. Restarting in {:?}...", cooldown);
+                tokio::select! {
+                    _ = tokio::time::sleep(cooldown) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Single execution of server run mode.
+    pub async fn start(&self) -> io::Result<()> {
         // 1. Determine run mode and flow direction
         let (initial_mode, target_to_test) = {
             let cfg = self.config.read();
@@ -95,21 +138,48 @@ impl TunnelServer {
         let client_ip = self.perform_handshake().await?;
         debug!("Handshake completed with client IP: {}", client_ip);
 
-        // 3. If TLS Mode 1 is active, regenerate RAM certificate with TLS 1.3
+        // 3. If TLS Mode 1 or Mode 2 is active, prepare certificate with TLS 1.3
         let (tls_acceptor, new_fingerprint) = {
             let cfg = self.config.read().clone();
             if cfg.tls_code != "0" {
-                let (cert, key) = generate_ephemeral_cert()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                let fp = format_cert_fingerprint(&cert);
+                let (certs, key) = if cfg.tls_code == "2" {
+                    let crt = cfg.crt_path.as_deref().unwrap_or("");
+                    let key = cfg.key_path.as_deref().unwrap_or("");
+                    if !crt.is_empty() && !key.is_empty() {
+                        match nodepass_core::crypto::load_certs_and_key(crt, key) {
+                            Ok((c, k)) => {
+                                info!("TLS code-2: Loaded user certificate from {}", crt);
+                                (c, k)
+                            }
+                            Err(e) => {
+                                warn!("TLS code-2: Certificate load failed: {}. Falling back to RAM cert", e);
+                                let (c, k) = generate_ephemeral_cert()
+                                    .map_err(|e| io::Error::other(e.to_string()))?;
+                                (vec![c], k)
+                            }
+                        }
+                    } else {
+                        warn!("TLS code-2: crt/key path not specified, falling back to RAM cert");
+                        let (c, k) = generate_ephemeral_cert()
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        (vec![c], k)
+                    }
+                } else {
+                    let (cert, key) = generate_ephemeral_cert()
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    (vec![cert], key)
+                };
+
+                let fp = format_cert_fingerprint(certs[0].as_ref());
                 if cfg.tls_code == "1" {
                     info!("TLS code-1: RAM cert regenerated with TLS 1.3");
                 }
                 let mut server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
-                    .with_single_cert(vec![cert], key)
+                    .with_single_cert(certs, key)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
                 server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(2048);
                 (Some(TlsAcceptor::from(Arc::new(server_config))), Some(fp))
             } else {
                 (None, None)
@@ -124,11 +194,27 @@ impl TunnelServer {
             "1" => {
                 // QUIC pool
                 let quic_pool = Arc::new(QuicPool::new(cfg.max_pool_capacity));
-                let (cert, key) = generate_ephemeral_cert()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let (certs, key) = if cfg.tls_code == "2" {
+                    let crt = cfg.crt_path.as_deref().unwrap_or("");
+                    let key = cfg.key_path.as_deref().unwrap_or("");
+                    if !crt.is_empty() && !key.is_empty() {
+                        nodepass_core::crypto::load_certs_and_key(crt, key).unwrap_or_else(|_| {
+                            let (c, k) = generate_ephemeral_cert().expect("ephemeral cert");
+                            (vec![c], k)
+                        })
+                    } else {
+                        let (c, k) = generate_ephemeral_cert()
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        (vec![c], k)
+                    }
+                } else {
+                    let (cert, key) = generate_ephemeral_cert()
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    (vec![cert], key)
+                };
                 let mut rustls_server_cfg = rustls::ServerConfig::builder()
                     .with_no_client_auth()
-                    .with_single_cert(vec![cert], key)
+                    .with_single_cert(certs, key)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
                 rustls_server_cfg.alpn_protocols = vec![b"np-quic".to_vec()];
                 let server_config = quinn::ServerConfig::with_crypto(Arc::new(
@@ -155,17 +241,23 @@ impl TunnelServer {
                 let tls_acc = tls_acceptor.clone();
                 let stop_flag = Arc::clone(&self.stop_flag);
                 tokio::spawn(async move {
-                    while !stop_flag.load(Ordering::Relaxed) {
-                        if let Ok((tcp_stream, _)) = listener.accept().await {
-                            let h2_p = Arc::clone(&h2_pool_clone);
-                            if let Some(ref acc) = tls_acc {
-                                if let Ok(tls_stream) = acc.accept(tcp_stream).await {
-                                    h2_p.start_server(tls_stream);
+                    while !stop_flag.load(Ordering::Acquire) {
+                        match listener.accept().await {
+                            Ok((tcp_stream, _)) => {
+                                let _ = nodepass_transport::stream::configure_tcp_socket(&tcp_stream);
+                                let h2_p = Arc::clone(&h2_pool_clone);
+                                if let Some(ref acc) = tls_acc {
+                                    if let Ok(tls_stream) = acc.accept(tcp_stream).await {
+                                        h2_p.start_server(tls_stream);
+                                        break;
+                                    }
+                                } else {
+                                    h2_p.start_server(tcp_stream);
                                     break;
                                 }
-                            } else {
-                                h2_p.start_server(tcp_stream);
-                                break;
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                         }
                     }
@@ -208,12 +300,25 @@ impl TunnelServer {
             let stats_clone = self.stats.clone();
             let rate_limiter_clone = self.rate_limiter.clone();
             let is_verified_tcp = Arc::clone(&is_verified);
+            let stop_flag_tcp = Arc::clone(&self.stop_flag);
 
             tokio::spawn(async move {
                 if let Some(target) = cfg_clone.target_addrs.first() {
                     if let Ok(listener) = TcpListener::bind(target).await {
-                        while let Ok((target_conn, remote_addr)) = listener.accept().await {
-                            if !is_verified_tcp.load(Ordering::SeqCst) {
+                        while !stop_flag_tcp.load(Ordering::Acquire) {
+                            let (target_conn, remote_addr) = match listener.accept().await {
+                                Ok(pair) => pair,
+                                Err(e) => {
+                                    if stop_flag_tcp.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    warn!("Target listener transient accept error: {}. Backing off 50ms...", e);
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    continue;
+                                }
+                            };
+                            let _ = nodepass_transport::stream::configure_tcp_socket(&target_conn);
+                            if !is_verified_tcp.load(Ordering::Acquire) {
                                 warn!("Dropping incoming TCP connection: TLS Mode 1 not yet verified");
                                 drop(target_conn);
                                 continue;
@@ -401,6 +506,7 @@ impl TunnelServer {
                                 if stats.try_acquire_slot(false) {
                                     if let Ok((_, target_addr)) = selector.select_next().await {
                                         if let Ok(mut target_conn) = TcpStream::connect(target_addr).await {
+                                            let _ = nodepass_transport::stream::configure_tcp_socket(&target_conn);
                                             if proxy_enabled {
                                                 if let Ok(client_addr) = remote_addr_str.parse::<SocketAddr>() {
                                                     let hdr = format_proxy_v1_header(client_addr, target_addr);
@@ -549,6 +655,13 @@ impl TunnelServer {
                 }
                 _ => {}
             }
+        }
+
+        if !*shutdown_rx.borrow() && !self.is_stopped() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "tunnel control connection lost",
+            ));
         }
 
         Ok(())

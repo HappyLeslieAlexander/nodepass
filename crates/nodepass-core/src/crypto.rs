@@ -18,6 +18,12 @@ pub enum CryptoError {
     Rustls(#[from] rustls::Error),
     #[error("Invalid token format")]
     InvalidToken,
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("No certificates found in PEM file")]
+    NoCertificatesFound,
+    #[error("No private key found in PEM file")]
+    NoPrivateKeyFound,
 }
 
 /// Computes the 32-bit FNV-1a hash of a string, returning an 8-character lowercase hex string.
@@ -127,14 +133,86 @@ pub fn generate_ephemeral_cert() -> Result<(CertificateDer<'static>, PrivateKeyD
     Ok((cert_der, key_der))
 }
 
+fn extract_pem_block(content: &str, begin_tag: &str, end_tag: &str) -> Result<Option<Vec<u8>>, CryptoError> {
+    if let Some(start_idx) = content.find(begin_tag) {
+        let after_begin = &content[start_idx + begin_tag.len()..];
+        if let Some(end_idx) = after_begin.find(end_tag) {
+            let b64_str: String = after_begin[..end_idx]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let der = base64::engine::general_purpose::STANDARD.decode(&b64_str)?;
+            return Ok(Some(der));
+        }
+    }
+    Ok(None)
+}
+
+/// Loads one or more X.509 certificates from a PEM file.
+pub fn load_pem_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, CryptoError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut certs = Vec::new();
+    let begin_tag = "-----BEGIN CERTIFICATE-----";
+    let end_tag = "-----END CERTIFICATE-----";
+
+    let mut rest = content.as_str();
+    while let Some(start_idx) = rest.find(begin_tag) {
+        let after_begin = &rest[start_idx + begin_tag.len()..];
+        if let Some(end_idx) = after_begin.find(end_tag) {
+            let b64_str: String = after_begin[..end_idx]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let der = base64::engine::general_purpose::STANDARD.decode(&b64_str)?;
+            certs.push(CertificateDer::from(der));
+            rest = &after_begin[end_idx + end_tag.len()..];
+        } else {
+            break;
+        }
+    }
+    if certs.is_empty() {
+        return Err(CryptoError::NoCertificatesFound);
+    }
+    Ok(certs)
+}
+
+/// Loads a private key (PKCS#8, RSA PKCS#1, or EC SEC1) from a PEM file.
+pub fn load_pem_key(path: &str) -> Result<PrivateKeyDer<'static>, CryptoError> {
+    let content = std::fs::read_to_string(path)?;
+
+    // PKCS#8
+    if let Some(der) = extract_pem_block(&content, "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----")? {
+        return Ok(PrivateKeyDer::Pkcs8(der.into()));
+    }
+    // RSA PKCS#1
+    if let Some(der) = extract_pem_block(&content, "-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----")? {
+        return Ok(PrivateKeyDer::Pkcs1(der.into()));
+    }
+    // EC SEC1
+    if let Some(der) = extract_pem_block(&content, "-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----")? {
+        return Ok(PrivateKeyDer::Sec1(der.into()));
+    }
+
+    Err(CryptoError::NoPrivateKeyFound)
+}
+
+/// Loads certificates and private key from file paths.
+pub fn load_certs_and_key(crt_path: &str, key_path: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), CryptoError> {
+    let certs = load_pem_certs(crt_path)?;
+    let key = load_pem_key(key_path)?;
+    Ok((certs, key))
+}
+
 /// Creates a rustls ServerConfig using the provided certificate and private key.
 pub fn create_server_tls_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ServerConfig, CryptoError> {
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
+    // Enable session resumption cache (L-4)
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(2048);
     Ok(config)
 }
 
@@ -146,12 +224,44 @@ pub fn create_mode1_client_tls_config(
         recorded_fingerprint,
     });
 
-    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 is supported")
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth()
+        .with_no_client_auth();
+    // Enable client session resumption cache (L-4)
+    config.resumption = rustls::client::Resumption::in_memory_sessions(2048);
+    config
+}
+
+/// Creates a rustls ClientConfig for TLS Mode 2 (CA verified or user certs).
+pub fn create_mode2_client_tls_config(
+    crt_path: Option<&str>,
+) -> Result<rustls::ClientConfig, CryptoError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    if let Some(path) = crt_path {
+        if !path.is_empty() {
+            if let Ok(certs) = load_pem_certs(path) {
+                for cert in certs {
+                    let _ = root_store.add(cert);
+                }
+            }
+        }
+    }
+
+    let mut config = if root_store.is_empty() {
+        let recorded = Arc::new(parking_lot::Mutex::new(None));
+        create_mode1_client_tls_config(recorded)
+    } else {
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is supported")
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+    config.resumption = rustls::client::Resumption::in_memory_sessions(2048);
+    Ok(config)
 }
 
 /// Custom ServerCertVerifier for TLS Mode 1.
@@ -269,5 +379,36 @@ mod tests {
         let (cert, _key) = generate_ephemeral_cert().unwrap();
         let fp = format_cert_fingerprint(cert.as_ref());
         assert_eq!(fp.len(), 64);
+    }
+
+    #[test]
+    fn test_load_pem_certs_and_key() {
+        use std::io::Write;
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+
+        // Generate an ephemeral cert and key to write out as PEM
+        let params = CertificateParams::new(vec!["test.nodepass.org".to_string()]).unwrap();
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        cert_file.write_all(cert.pem().as_bytes()).unwrap();
+        key_file.write_all(key_pair.serialize_pem().as_bytes()).unwrap();
+
+        let certs = load_pem_certs(cert_file.path().to_str().unwrap()).unwrap();
+        assert_eq!(certs.len(), 1);
+
+        let key = load_pem_key(key_file.path().to_str().unwrap()).unwrap();
+        match key {
+            PrivateKeyDer::Pkcs8(_) => {},
+            _ => panic!("expected PKCS8 key"),
+        }
+
+        let (c, k) = load_certs_and_key(
+            cert_file.path().to_str().unwrap(),
+            key_file.path().to_str().unwrap(),
+        ).unwrap();
+        assert_eq!(c.len(), 1);
+        assert!(matches!(k, PrivateKeyDer::Pkcs8(_)));
     }
 }

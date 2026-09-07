@@ -130,32 +130,49 @@ impl H2Pool {
 
             *send_request.lock().await = Some(client.clone());
 
-            // Pool expansion loop
-            while !stop_flag.load(Ordering::Relaxed) {
-                let current = active_count.load(Ordering::Relaxed);
+            let min_interval = nodepass_core::config::min_pool_interval();
+            let max_interval = nodepass_core::config::max_pool_interval();
+
+            // Pool expansion loop with progressive backoff on idle/unreachable (H-5)
+            let mut interval = min_interval;
+            while !stop_flag.load(Ordering::Acquire) {
+                let current = active_count.load(Ordering::Acquire);
                 if current < min_capacity {
                     let mut ready_client = match client.clone().ready().await {
                         Ok(c) => c,
                         Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            interval = (interval + Duration::from_millis(100)).min(max_interval);
+                            tokio::time::sleep(interval).await;
                             continue;
                         }
                     };
-                    let req = Request::builder().uri("/data").body(()).unwrap();
+                    let req = match Request::builder().uri("/data").body(()) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            interval = (interval + Duration::from_millis(100)).min(max_interval);
+                            tokio::time::sleep(interval).await;
+                            continue;
+                        }
+                    };
                     if let Ok((res_future, send)) = ready_client.send_request(req, false) {
                         let stream_tx = stream_tx.clone();
                         let active_count = Arc::clone(&active_count);
+                        interval = min_interval;
                         tokio::spawn(async move {
                             if let Ok(res) = res_future.await {
                                 let recv = res.into_body();
                                 let boxed = box_stream(H2Stream::new(send, recv));
-                                active_count.fetch_add(1, Ordering::Relaxed);
+                                active_count.fetch_add(1, Ordering::Release);
                                 let _ = stream_tx.send(boxed).await;
                             }
                         });
+                    } else {
+                        interval = (interval + Duration::from_millis(100)).min(max_interval);
                     }
+                } else {
+                    interval = (interval + Duration::from_millis(100)).min(max_interval);
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(interval).await;
             }
         });
     }

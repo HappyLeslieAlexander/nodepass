@@ -41,6 +41,7 @@ hmac = "0.12"
 base64 = "0.22"
 dashmap = "6.0"
 parking_lot = "0.12"
+socket2 = "0.6"
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["connect", "handshake"] }
 h2 = "0.4"

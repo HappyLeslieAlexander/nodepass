@@ -56,3 +56,35 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for SplitStream<R, W> {
         Pin::new(&mut self.writer).poll_shutdown(cx)
     }
 }
+
+/// Configures standard production TCP socket options:
+/// - TCP_NODELAY (disables Nagle algorithm to reduce latency for interactive traffic)
+/// - SO_KEEPALIVE (probes every 15s to detect dead connections and prevent resource leaks)
+pub fn configure_tcp_socket(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let _ = stream.set_nodelay(true);
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(15))
+        .with_interval(std::time::Duration::from_secs(15));
+    let _ = sock_ref.set_tcp_keepalive(&keepalive);
+    Ok(())
+}
+
+/// Returns true if an I/O error during accept or connect is transient (e.g. EMFILE, ENFILE, ECONNABORTED, EINTR).
+pub fn is_transient_error(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error() {
+        // EMFILE (24), ENFILE (23), ENOBUFS (55 on BSD/macOS, 105 on Linux), ENOMEM (12)
+        if code == 24 || code == 23 || code == 12 || code == 55 || code == 105 {
+            return true;
+        }
+    }
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
+}
+

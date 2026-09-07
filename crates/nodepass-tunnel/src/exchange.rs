@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bidirectional data pump between two asynchronous streams.
-/// Supports half-close FIN propagation and per-read idle timeouts.
+/// Supports half-close FIN propagation and per-read idle timeouts without task/connection leaks.
 pub async fn data_exchange<S1, S2>(
     s1: S1,
     s2: S2,
@@ -19,6 +19,8 @@ where
 }
 
 /// Bidirectional data pump with traffic accounting (rx/tx atomic counters) and token-bucket rate limiting.
+/// Uses tokio::select! with mutual shutdown cancellation to guarantee that when one side
+/// errors or times out, the other side is immediately cancelled and both streams are closed cleanly.
 pub async fn data_exchange_with_stats<S1, S2>(
     s1: S1,
     s2: S2,
@@ -43,16 +45,29 @@ where
             let read_fut = r1.read(&mut buf);
             let n = if idle_timeout > Duration::ZERO {
                 match tokio::time::timeout(idle_timeout, read_fut).await {
-                    Ok(res) => res?,
+                    Ok(res) => match res {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = w2.shutdown().await;
+                            return Err(e);
+                        }
+                    },
                     Err(_) => {
+                        let _ = w2.shutdown().await;
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "connection read timed out",
-                        ))
+                        ));
                     }
                 }
             } else {
-                read_fut.await?
+                match read_fut.await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = w2.shutdown().await;
+                        return Err(e);
+                    }
+                }
             };
 
             if n == 0 {
@@ -80,16 +95,29 @@ where
             let read_fut = r2.read(&mut buf);
             let n = if idle_timeout > Duration::ZERO {
                 match tokio::time::timeout(idle_timeout, read_fut).await {
-                    Ok(res) => res?,
+                    Ok(res) => match res {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = w1.shutdown().await;
+                            return Err(e);
+                        }
+                    },
                     Err(_) => {
+                        let _ = w1.shutdown().await;
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "connection read timed out",
-                        ))
+                        ));
                     }
                 }
             } else {
-                read_fut.await?
+                match read_fut.await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = w1.shutdown().await;
+                        return Err(e);
+                    }
+                }
             };
 
             if n == 0 {
@@ -111,8 +139,23 @@ where
         Ok::<(), io::Error>(())
     };
 
-    let (res1, res2) = tokio::join!(pump1, pump2);
-    res1.and(res2)
+    tokio::pin!(pump1);
+    tokio::pin!(pump2);
+
+    tokio::select! {
+        res1 = &mut pump1 => {
+            match res1 {
+                Ok(()) => pump2.await,
+                Err(e) => Err(e),
+            }
+        }
+        res2 = &mut pump2 => {
+            match res2 {
+                Ok(()) => pump1.await,
+                Err(e) => Err(e),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +209,22 @@ mod tests {
 
         let res = handle.await.unwrap();
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_data_exchange_timeout_cancels_peer() {
+        let (c1, _s1) = tokio::io::duplex(1024);
+        let (c2, _s2) = tokio::io::duplex(1024);
+
+        // Idle timeout of 50ms. Neither side sends anything.
+        let res = tokio::time::timeout(
+            Duration::from_millis(500),
+            data_exchange(c1, c2, Duration::from_millis(50), 1024),
+        ).await;
+
+        assert!(res.is_ok(), "data_exchange did not complete within 500ms");
+        let exchange_res = res.unwrap();
+        assert!(exchange_res.is_err());
+        assert_eq!(exchange_res.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 }

@@ -27,3 +27,4 @@ rand = { workspace = true }
 url = { workspace = true }
 http = { workspace = true }
 quinn = { workspace = true }
+socket2 = { workspace = true }

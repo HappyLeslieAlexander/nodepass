@@ -48,6 +48,10 @@ fn create_test_app() -> (axum::Router, String) {
         alias: "test-alias".to_string(),
         hostname: "localhost".to_string(),
         start_time: Instant::now(),
+        log_level: None,
+        tls_code: None,
+        crt_path: None,
+        key_path: None,
     };
 
     (create_router(state), api_key)
@@ -95,6 +99,9 @@ async fn test_rest_api_auth_and_crud() {
     let created_inst: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     let inst_id = created_inst["id"].as_str().unwrap();
     assert_eq!(created_inst["alias"], "web-tunnel");
+    let config_str = created_inst["config"].as_str().unwrap();
+    assert!(config_str.contains("dns=5m0s"));
+    assert!(config_str.contains("min=64"));
 
     // 4. Get instance by ID
     let req = Request::builder()
@@ -106,7 +113,70 @@ async fn test_rest_api_auth_and_crud() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 5. OpenAPI spec (Public, no auth)
+    // 5. PATCH instance (action reset, update alias and meta)
+    let patch_body = json!({
+        "action": "reset",
+        "alias": "renamed-tunnel",
+        "meta": {
+            "tags": {
+                "env": "production"
+            }
+        }
+    });
+    let req = Request::builder()
+        .uri(format!("/api/v1/instances/{}", inst_id))
+        .method("PATCH")
+        .header("X-API-Key", &api_key)
+        .header("Content-Type", "application/json")
+        .body(Body::from(patch_body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let patched_inst: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(patched_inst["alias"], "renamed-tunnel");
+    assert_eq!(patched_inst["meta"]["tags"]["env"], "production");
+
+    // 6. PUT instance (replace URL configuration)
+    let put_body = json!({
+        "url": "client://:newpass@127.0.0.1:9090/127.0.0.1:90"
+    });
+    let req = Request::builder()
+        .uri(format!("/api/v1/instances/{}", inst_id))
+        .method("PUT")
+        .header("X-API-Key", &api_key)
+        .header("Content-Type", "application/json")
+        .body(Body::from(put_body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let put_inst: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(put_inst["url"].as_str().unwrap().contains("9090"));
+    assert!(put_inst["config"].as_str().unwrap().contains("9090"));
+
+    // 7. PUT instance with same URL -> 409 Conflict
+    let req = Request::builder()
+        .uri(format!("/api/v1/instances/{}", inst_id))
+        .method("PUT")
+        .header("X-API-Key", &api_key)
+        .header("Content-Type", "application/json")
+        .body(Body::from(put_body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // 8. DELETE instance
+    let req = Request::builder()
+        .uri(format!("/api/v1/instances/{}", inst_id))
+        .method("DELETE")
+        .header("X-API-Key", &api_key)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // 9. OpenAPI spec (Public, no auth)
     let req = Request::builder()
         .uri("/api/v1/openapi.json")
         .method("GET")
@@ -115,7 +185,7 @@ async fn test_rest_api_auth_and_crud() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 6. Swagger UI HTML (Public, no auth)
+    // 10. Swagger UI HTML (Public, no auth)
     let req = Request::builder()
         .uri("/api/v1/docs")
         .method("GET")

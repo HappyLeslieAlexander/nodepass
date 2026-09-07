@@ -48,42 +48,48 @@ impl WsPool {
         let stop_flag = Arc::clone(&self.stop_flag);
 
         tokio::spawn(async move {
-            while !stop_flag.load(Ordering::Relaxed) {
-                if let Ok((tcp_stream, _)) = listener.accept().await {
-                    let tls_opt = tls_acceptor.clone();
-                    let control_stream = Arc::clone(&control_stream);
-                    let control_notify = Arc::clone(&control_notify);
-                    let idle_tx = idle_tx.clone();
-                    let active_count = Arc::clone(&active_count);
-                    let is_ready = Arc::clone(&is_ready);
+            while !stop_flag.load(Ordering::Acquire) {
+                match listener.accept().await {
+                    Ok((tcp_stream, _)) => {
+                        let _ = crate::stream::configure_tcp_socket(&tcp_stream);
+                        let tls_opt = tls_acceptor.clone();
+                        let control_stream = Arc::clone(&control_stream);
+                        let control_notify = Arc::clone(&control_notify);
+                        let idle_tx = idle_tx.clone();
+                        let active_count = Arc::clone(&active_count);
+                        let is_ready = Arc::clone(&is_ready);
 
-                    tokio::spawn(async move {
-                        let ws_stream = if let Some(ref acceptor) = tls_opt {
-                            match acceptor.accept(tcp_stream).await {
-                                Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
+                        tokio::spawn(async move {
+                            let ws_stream = if let Some(ref acceptor) = tls_opt {
+                                match acceptor.accept(tcp_stream).await {
+                                    Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
+                                        Ok(ws) => box_stream(WsStream::new(ws)),
+                                        Err(_) => return,
+                                    },
+                                    Err(_) => return,
+                                }
+                            } else {
+                                match tokio_tungstenite::accept_async(tcp_stream).await {
                                     Ok(ws) => box_stream(WsStream::new(ws)),
                                     Err(_) => return,
-                                },
-                                Err(_) => return,
-                            }
-                        } else {
-                            match tokio_tungstenite::accept_async(tcp_stream).await {
-                                Ok(ws) => box_stream(WsStream::new(ws)),
-                                Err(_) => return,
-                            }
-                        };
+                                }
+                            };
 
-                        let mut cs = control_stream.lock().await;
-                        if cs.is_none() && !is_ready.load(Ordering::SeqCst) {
-                            *cs = Some(ws_stream);
-                            is_ready.store(true, Ordering::SeqCst);
-                            control_notify.notify_waiters();
-                        } else {
-                            drop(cs);
-                            active_count.fetch_add(1, Ordering::Relaxed);
-                            let _ = idle_tx.send(ws_stream).await;
-                        }
-                    });
+                            let mut cs = control_stream.lock().await;
+                            if cs.is_none() && !is_ready.load(Ordering::Acquire) {
+                                *cs = Some(ws_stream);
+                                is_ready.store(true, Ordering::Release);
+                                control_notify.notify_waiters();
+                            } else {
+                                drop(cs);
+                                active_count.fetch_add(1, Ordering::Release);
+                                let _ = idle_tx.send(ws_stream).await;
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
         });
@@ -105,14 +111,20 @@ impl WsPool {
         let stop_flag = Arc::clone(&self.stop_flag);
 
         tokio::spawn(async move {
-            // First: connect control stream
-            while !stop_flag.load(Ordering::Relaxed) {
+            let min_interval = nodepass_core::config::min_pool_interval();
+            let max_interval = nodepass_core::config::max_pool_interval();
+
+            // First: connect control stream with progressive backoff on failure
+            let mut ctrl_interval = min_interval;
+            while !stop_flag.load(Ordering::Acquire) {
                 if let Ok(tcp_stream) = TcpStream::connect(tunnel_addr).await {
+                    let _ = crate::stream::configure_tcp_socket(&tcp_stream);
                     let boxed_tcp: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
                         match connector.connect(name.clone(), tcp_stream).await {
                             Ok(tls_stream) => box_stream(tls_stream),
                             Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                ctrl_interval = (ctrl_interval + Duration::from_millis(100)).min(max_interval);
+                                tokio::time::sleep(ctrl_interval).await;
                                 continue;
                             }
                         }
@@ -122,40 +134,57 @@ impl WsPool {
 
                     if let Ok((ws, _)) = tokio_tungstenite::client_async(&ws_url, boxed_tcp).await {
                         *control_stream.lock().await = Some(box_stream(WsStream::new(ws)));
-                        is_ready.store(true, Ordering::SeqCst);
+                        is_ready.store(true, Ordering::Release);
                         control_notify.notify_waiters();
                         break;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                ctrl_interval = (ctrl_interval + Duration::from_millis(100)).min(max_interval);
+                tokio::time::sleep(ctrl_interval).await;
             }
 
-            // Pool expansion loop
-            while !stop_flag.load(Ordering::Relaxed) {
-                let current = active_count.load(Ordering::Relaxed);
+            // Pool expansion loop with progressive backoff on idle/unreachable (H-5)
+            let mut interval = min_interval;
+            while !stop_flag.load(Ordering::Acquire) {
+                let current = active_count.load(Ordering::Acquire);
                 if current < min_capacity {
-                    if let Ok(tcp_stream) = TcpStream::connect(tunnel_addr).await {
-                        let boxed_tcp: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
-                            match connector.connect(name.clone(), tcp_stream).await {
-                                Ok(tls_stream) => box_stream(tls_stream),
+                    match TcpStream::connect(tunnel_addr).await {
+                        Ok(tcp_stream) => {
+                            let _ = crate::stream::configure_tcp_socket(&tcp_stream);
+                            let boxed_tcp: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
+                                match connector.connect(name.clone(), tcp_stream).await {
+                                    Ok(tls_stream) => box_stream(tls_stream),
+                                    Err(_) => {
+                                        interval = (interval + Duration::from_millis(100)).min(max_interval);
+                                        tokio::time::sleep(interval).await;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                box_stream(tcp_stream)
+                            };
+
+                            match tokio_tungstenite::client_async(&ws_url, boxed_tcp).await {
+                                Ok((ws, _)) => {
+                                    active_count.fetch_add(1, Ordering::Release);
+                                    interval = min_interval;
+                                    if idle_tx.send(box_stream(WsStream::new(ws))).await.is_err() {
+                                        break;
+                                    }
+                                }
                                 Err(_) => {
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                    continue;
+                                    interval = (interval + Duration::from_millis(100)).min(max_interval);
                                 }
                             }
-                        } else {
-                            box_stream(tcp_stream)
-                        };
-
-                        if let Ok((ws, _)) = tokio_tungstenite::client_async(&ws_url, boxed_tcp).await {
-                            active_count.fetch_add(1, Ordering::Relaxed);
-                            if idle_tx.send(box_stream(WsStream::new(ws))).await.is_err() {
-                                break;
-                            }
+                        }
+                        Err(_) => {
+                            interval = (interval + Duration::from_millis(100)).min(max_interval);
                         }
                     }
+                } else {
+                    interval = (interval + Duration::from_millis(100)).min(max_interval);
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(interval).await;
             }
         });
     }

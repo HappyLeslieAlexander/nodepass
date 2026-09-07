@@ -204,8 +204,8 @@ impl TunnelConfig {
             });
         }
 
-        // QUIC (type=1) and WebSocket (type=2) require TLS
-        if (pool_type == "1" || pool_type == "2") && tls_code == "0" {
+        // QUIC (type=1) requires TLS (1:1 with Go)
+        if pool_type == "1" && tls_code == "0" {
             tls_code = "1".to_string();
         }
 
@@ -349,11 +349,97 @@ pub fn format_duration(d: Duration) -> String {
         "0s".to_string()
     } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs.is_multiple_of(60) {
-        format!("{}m", secs / 60)
     } else {
         format!("{}s", secs)
     }
+}
+
+pub fn parse_env_duration(key: &str, default: Duration) -> Duration {
+    if let Ok(val) = std::env::var(key) {
+        if let Some(d) = parse_duration(&val) {
+            return d;
+        }
+    }
+    default
+}
+
+pub fn parse_env_usize(key: &str, default: usize) -> usize {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(num) = val.trim().parse::<usize>() {
+            return num;
+        }
+    }
+    default
+}
+
+pub fn parse_env_i32(key: &str, default: i32) -> i32 {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(num) = val.trim().parse::<i32>() {
+            return num;
+        }
+    }
+    default
+}
+
+// Runtime dynamic getters that read NP_* environment variables with fallback to constants
+pub fn tcp_data_buf_size() -> usize {
+    parse_env_usize("NP_TCP_DATA_BUF_SIZE", 16384)
+}
+
+pub fn udp_data_buf_size() -> usize {
+    parse_env_usize("NP_UDP_DATA_BUF_SIZE", 16384)
+}
+
+pub fn handshake_timeout() -> Duration {
+    parse_env_duration("NP_HANDSHAKE_TIMEOUT", HANDSHAKE_TIMEOUT)
+}
+
+pub fn tcp_dial_timeout() -> Duration {
+    parse_env_duration("NP_TCP_DIAL_TIMEOUT", TCP_DIAL_TIMEOUT)
+}
+
+pub fn udp_dial_timeout() -> Duration {
+    parse_env_duration("NP_UDP_DIAL_TIMEOUT", UDP_DIAL_TIMEOUT)
+}
+
+pub fn udp_read_timeout() -> Duration {
+    parse_env_duration("NP_UDP_READ_TIMEOUT", UDP_READ_TIMEOUT)
+}
+
+pub fn pool_get_timeout() -> Duration {
+    parse_env_duration("NP_POOL_GET_TIMEOUT", POOL_GET_TIMEOUT)
+}
+
+pub fn min_pool_interval() -> Duration {
+    parse_env_duration("NP_MIN_POOL_INTERVAL", MIN_POOL_INTERVAL)
+}
+
+pub fn max_pool_interval() -> Duration {
+    parse_env_duration("NP_MAX_POOL_INTERVAL", MAX_POOL_INTERVAL)
+}
+
+pub fn report_interval() -> Duration {
+    parse_env_duration("NP_REPORT_INTERVAL", REPORT_INTERVAL)
+}
+
+pub fn fallback_interval() -> Duration {
+    parse_env_duration("NP_FALLBACK_INTERVAL", FALLBACK_INTERVAL)
+}
+
+pub fn service_cooldown() -> Duration {
+    parse_env_duration("NP_SERVICE_COOLDOWN", SERVICE_COOLDOWN)
+}
+
+pub fn shutdown_timeout() -> Duration {
+    parse_env_duration("NP_SHUTDOWN_TIMEOUT", SHUTDOWN_TIMEOUT)
+}
+
+pub fn reload_interval() -> Duration {
+    parse_env_duration("NP_RELOAD_INTERVAL", RELOAD_INTERVAL)
+}
+
+pub fn semaphore_limit() -> usize {
+    parse_env_usize("NP_SEMAPHORE_LIMIT", 65536)
 }
 
 #[cfg(test)]
@@ -430,5 +516,29 @@ mod tests {
         let url2 = "client://:secret%40pass%3F@server.com:10101/10.0.0.1:80";
         let cfg2 = TunnelConfig::parse(url2).unwrap();
         assert_eq!(cfg2.tunnel_key, "secret@pass?");
+    }
+
+    #[test]
+    fn test_ws_tls_not_upgraded() {
+        // H-4: WebSocket (type=2) should NOT upgrade tls_code from "0" to "1"
+        let url = "server://0.0.0.0:10101/127.0.0.1:8080?type=2&tls=0";
+        let cfg = TunnelConfig::parse(url).unwrap();
+        assert_eq!(cfg.tls_code, "0");
+    }
+
+    #[test]
+    fn test_env_runtime_params() {
+        // M-1: Test reading NP_* environment variables
+        std::env::set_var("NP_TCP_DATA_BUF_SIZE", "32768");
+        std::env::set_var("NP_HANDSHAKE_TIMEOUT", "10s");
+        std::env::set_var("NP_MIN_POOL_INTERVAL", "250ms");
+
+        assert_eq!(tcp_data_buf_size(), 32768);
+        assert_eq!(handshake_timeout(), Duration::from_secs(10));
+        assert_eq!(min_pool_interval(), Duration::from_millis(250));
+
+        std::env::remove_var("NP_TCP_DATA_BUF_SIZE");
+        std::env::remove_var("NP_HANDSHAKE_TIMEOUT");
+        std::env::remove_var("NP_MIN_POOL_INTERVAL");
     }
 }

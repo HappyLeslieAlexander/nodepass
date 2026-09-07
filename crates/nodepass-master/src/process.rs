@@ -214,6 +214,15 @@ impl ProcessManager {
         self.start_instance(id).await
     }
 
+    fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
+        if !s.contains('\x1b') {
+            return std::borrow::Cow::Borrowed(s);
+        }
+        static ANSI_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let re = ANSI_RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;?]*[a-zA-Z]").unwrap());
+        std::borrow::Cow::Owned(re.replace_all(s, "").into_owned())
+    }
+
     fn process_log_line(
         instance_id: &str,
         line: &str,
@@ -221,7 +230,8 @@ impl ProcessManager {
         event_tx: &broadcast::Sender<InstanceEvent>,
         re: &Regex,
     ) {
-        if let Some(caps) = re.captures(line) {
+        let clean_line = Self::strip_ansi(line);
+        if let Some(caps) = re.captures(&clean_line) {
             if let Some(mut inst) = instances.get_mut(instance_id) {
                 if let Ok(v) = caps[1].parse::<i32>() { inst.mode = v; }
                 if let Ok(v) = caps[2].parse::<i32>() { inst.ping = v; }
@@ -260,7 +270,7 @@ impl ProcessManager {
             return;
         }
 
-        if line.contains("Server error:") || line.contains("Client error:") {
+        if clean_line.contains("Server error:") || clean_line.contains("Client error:") {
             if let Some(mut inst) = instances.get_mut(instance_id) {
                 inst.status = "error".to_string();
                 inst.ping = 0;
@@ -294,9 +304,40 @@ impl ProcessManager {
 }
 
 fn chrono_now_string() -> String {
-    // Return timestamp formatted like 2006-01-02 15:04:05
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}", d.as_secs())
+    crate::types::now_timestamp_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi_and_checkpoint_regex() {
+        let raw_line = "\x1b[32m2026-09-07T12:00:00Z INFO\x1b[0m CHECK_POINT|MODE=2|PING=18ms|POOL=12|TCPS=3|UDPS=4|TCPRX=1024|TCPTX=2048|UDPRX=512|UDPTX=256\x1b[0m";
+        let cleaned = ProcessManager::strip_ansi(raw_line);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(cleaned.contains("CHECK_POINT|MODE=2|PING=18ms|POOL=12|TCPS=3|UDPS=4|TCPRX=1024|TCPTX=2048|UDPRX=512|UDPTX=256"));
+
+        let instances = Arc::new(DashMap::new());
+        let (event_tx, _) = broadcast::channel(16);
+        let pm = ProcessManager::new(Arc::clone(&instances), event_tx.clone());
+
+        let mut inst = Instance::new("inst-1".to_string(), "test".to_string(), "client".to_string(), "client://".to_string());
+        inst.status = "running".to_string();
+        instances.insert("inst-1".to_string(), inst);
+
+        ProcessManager::process_log_line("inst-1", raw_line, &instances, &event_tx, &pm.checkpoint_regex);
+
+        let updated = instances.get("inst-1").unwrap();
+        assert_eq!(updated.mode, 2);
+        assert_eq!(updated.ping, 18);
+        assert_eq!(updated.pool, 12);
+        assert_eq!(updated.tcps, 3);
+        assert_eq!(updated.udps, 4);
+        assert_eq!(updated.tcprx, 1024);
+        assert_eq!(updated.tcptx, 2048);
+        assert_eq!(updated.udprx, 512);
+        assert_eq!(updated.udptx, 256);
+    }
+}
+

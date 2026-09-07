@@ -53,9 +53,10 @@ impl TcpPool {
 
         tokio::spawn(async move {
             let mut is_first = true;
-            while !stop_flag.load(Ordering::Relaxed) {
+            while !stop_flag.load(Ordering::Acquire) {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let _ = crate::stream::configure_tcp_socket(&stream);
                         let boxed: BoxedStream = if let Some(ref acceptor) = tls_acceptor {
                             match acceptor.accept(stream).await {
                                 Ok(tls_stream) => box_stream(tls_stream),
@@ -68,10 +69,10 @@ impl TcpPool {
                         if is_first {
                             is_first = false;
                             *control_stream.lock().await = Some(boxed);
-                            is_ready.store(true, Ordering::SeqCst);
+                            is_ready.store(true, Ordering::Release);
                             control_notify.notify_waiters();
                         } else {
-                            active_count.fetch_add(1, Ordering::Relaxed);
+                            active_count.fetch_add(1, Ordering::Release);
                             let _ = idle_tx.send(boxed).await;
                         }
                     }
@@ -98,14 +99,20 @@ impl TcpPool {
         let stop_flag = Arc::clone(&self.stop_flag);
 
         tokio::spawn(async move {
-            // First: establish the control connection
-            while !stop_flag.load(Ordering::Relaxed) {
+            let min_interval = nodepass_core::config::min_pool_interval();
+            let max_interval = nodepass_core::config::max_pool_interval();
+
+            // First: establish the control connection with progressive backoff on failure
+            let mut ctrl_interval = min_interval;
+            while !stop_flag.load(Ordering::Acquire) {
                 if let Ok(stream) = TcpStream::connect(tunnel_addr).await {
+                    let _ = crate::stream::configure_tcp_socket(&stream);
                     let boxed: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
                         match connector.connect(name.clone(), stream).await {
                             Ok(tls_stream) => box_stream(tls_stream),
                             Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                ctrl_interval = (ctrl_interval + Duration::from_millis(100)).min(max_interval);
+                                tokio::time::sleep(ctrl_interval).await;
                                 continue;
                             }
                         }
@@ -114,37 +121,51 @@ impl TcpPool {
                     };
 
                     *control_stream.lock().await = Some(boxed);
-                    is_ready.store(true, Ordering::SeqCst);
+                    is_ready.store(true, Ordering::Release);
                     control_notify.notify_waiters();
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                ctrl_interval = (ctrl_interval + Duration::from_millis(100)).min(max_interval);
+                tokio::time::sleep(ctrl_interval).await;
             }
 
-            // Pool expansion loop
-            while !stop_flag.load(Ordering::Relaxed) {
-                let current = active_count.load(Ordering::Relaxed);
+            // Pool expansion loop with progressive backoff on idle/unreachable (H-5)
+            let mut interval = min_interval;
+            while !stop_flag.load(Ordering::Acquire) {
+                let current = active_count.load(Ordering::Acquire);
                 if current < min_capacity {
-                    if let Ok(stream) = TcpStream::connect(tunnel_addr).await {
-                        let boxed: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
-                            match connector.connect(name.clone(), stream).await {
-                                Ok(tls_stream) => box_stream(tls_stream),
-                                Err(_) => {
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                    continue;
+                    match TcpStream::connect(tunnel_addr).await {
+                        Ok(stream) => {
+                            let _ = crate::stream::configure_tcp_socket(&stream);
+                            let boxed: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
+                                match connector.connect(name.clone(), stream).await {
+                                    Ok(tls_stream) => box_stream(tls_stream),
+                                    Err(_) => {
+                                        interval = (interval + Duration::from_millis(100)).min(max_interval);
+                                        tokio::time::sleep(interval).await;
+                                        continue;
+                                    }
                                 }
-                            }
-                        } else {
-                            box_stream(stream)
-                        };
+                            } else {
+                                box_stream(stream)
+                            };
 
-                        active_count.fetch_add(1, Ordering::Relaxed);
-                        if idle_tx.send(boxed).await.is_err() {
-                            break;
+                            active_count.fetch_add(1, Ordering::Release);
+                            interval = min_interval; // reset interval on successful addition
+                            if idle_tx.send(boxed).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            // Unreachable: progressively back off interval toward max_pool_interval
+                            interval = (interval + Duration::from_millis(100)).min(max_interval);
                         }
                     }
+                } else {
+                    // Pool is satisfied (idle): back off gradually
+                    interval = (interval + Duration::from_millis(100)).min(max_interval);
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(interval).await;
             }
         });
     }

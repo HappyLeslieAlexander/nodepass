@@ -7,7 +7,8 @@ use nodepass_core::config::{
     TunnelConfig, POOL_GET_TIMEOUT, REPORT_INTERVAL, UDP_READ_TIMEOUT,
 };
 use nodepass_core::crypto::{
-    constant_time_eq, create_mode1_client_tls_config, generate_auth_token,
+    constant_time_eq, create_mode1_client_tls_config, create_mode2_client_tls_config,
+    generate_auth_token,
 };
 use nodepass_core::protocol::{detect_block_protocol, format_proxy_v1_header, Signal};
 use nodepass_transport::framed::{read_udp_frame, write_udp_frame};
@@ -57,9 +58,10 @@ impl TunnelClient {
         ));
         let rate_limiter = RateLimiter::new(config.rate_limit, config.rate_limit);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let slot_limit = config.slot_limit.max(1);
         Self {
             config: Arc::new(parking_lot::RwLock::new(config)),
-            stats: Stats::new(65536),
+            stats: Stats::new(slot_limit),
             dns_cache,
             selector,
             rate_limiter,
@@ -70,11 +72,52 @@ impl TunnelClient {
     }
 
     pub fn stop(&self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
+        self.stop_flag.store(true, Ordering::Release);
         let _ = self.shutdown_tx.send(true);
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.stop_flag.load(Ordering::Acquire)
+    }
+
+    /// Auto-restart supervisor loop with SERVICE_COOLDOWN delay (H-1).
     pub async fn run(&self) -> io::Result<()> {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        while !self.stop_flag.load(Ordering::Acquire) {
+            if let Err(e) = self.start().await {
+                if self.stop_flag.load(Ordering::Acquire) || *shutdown_rx.borrow() {
+                    break;
+                }
+                let cooldown = nodepass_core::config::service_cooldown();
+                warn!("Tunnel client error: {}. Restarting in {:?}...", e, cooldown);
+                tokio::select! {
+                    _ = tokio::time::sleep(cooldown) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                if self.stop_flag.load(Ordering::Acquire) || *shutdown_rx.borrow() {
+                    break;
+                }
+                let cooldown = nodepass_core::config::service_cooldown();
+                warn!("Tunnel client finished unexpectedly. Restarting in {:?}...", cooldown);
+                tokio::select! {
+                    _ = tokio::time::sleep(cooldown) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn start(&self) -> io::Result<()> {
         let mode = self.config.read().run_mode.clone();
         match mode.as_str() {
             "1" => self.run_single_mode().await,
@@ -202,6 +245,7 @@ impl TunnelClient {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((client_conn, client_addr)) => {
+                            let _ = nodepass_transport::stream::configure_tcp_socket(&client_conn);
                             if !stats.try_acquire_slot(false) {
                                 warn!("Single mode: TCP slot limit reached");
                                 continue;
@@ -229,6 +273,7 @@ impl TunnelClient {
                                 // Dial target
                                 if let Ok((_target_str, target_addr)) = selector.select_next().await {
                                     if let Ok(mut target_conn) = TcpStream::connect(target_addr).await {
+                                        let _ = nodepass_transport::stream::configure_tcp_socket(&target_conn);
                                         if proxy_enabled {
                                             let hdr = format_proxy_v1_header(client_addr, target_addr);
                                             let _ = tokio::io::AsyncWriteExt::write_all(
@@ -253,8 +298,12 @@ impl TunnelClient {
                                 stats.release_slot(false);
                             });
                         }
-                        Err(_e) => {
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        Err(e) => {
+                            if nodepass_transport::stream::is_transient_error(&e) {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
                         }
                     }
                 }
@@ -290,20 +339,45 @@ impl TunnelClient {
         // 2. Initialize connection pool
         let recorded_fp = Arc::new(parking_lot::Mutex::new(None));
         let is_verified = Arc::new(AtomicBool::new(cfg.tls_code != "1"));
+        let make_client_tls_config = |alpn: Option<Vec<Vec<u8>>>| -> (rustls::ClientConfig, rustls::pki_types::ServerName<'static>) {
+            let mut tls_cfg = if cfg.tls_code == "2" {
+                create_mode2_client_tls_config(cfg.crt_path.as_deref())
+                    .unwrap_or_else(|_| create_mode1_client_tls_config(Arc::clone(&recorded_fp)))
+            } else {
+                create_mode1_client_tls_config(Arc::clone(&recorded_fp))
+            };
+            if let Some(alpns) = alpn {
+                tls_cfg.alpn_protocols = alpns;
+            }
+            let sni_str = if !cfg.server_name.is_empty() {
+                cfg.server_name.clone()
+            } else {
+                "localhost".to_string()
+            };
+            let domain_name = rustls::pki_types::ServerName::try_from(sni_str)
+                .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap())
+                .to_owned();
+            (tls_cfg, domain_name)
+        };
+
         let pool: Arc<dyn TransportPool> = match cfg.pool_type.as_str() {
             "1" => {
                 // QUIC pool
                 let quic_pool = Arc::new(QuicPool::new(cfg.max_pool_capacity));
                 let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-                let mut client_tls_cfg = create_mode1_client_tls_config(Arc::clone(&recorded_fp));
-                client_tls_cfg.alpn_protocols = vec![b"np-quic".to_vec()];
+                let (client_tls_cfg, _domain_name) = make_client_tls_config(Some(vec![b"np-quic".to_vec()]));
                 let quic_client_config = quinn::ClientConfig::new(Arc::new(
                     quinn::crypto::rustls::QuicClientConfig::try_from(client_tls_cfg)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?,
                 ));
                 endpoint.set_default_client_config(quic_client_config);
                 let server_addr = self.dns_cache.resolve(&cfg.tunnel_addr).await?;
-                quic_pool.start_client(endpoint, server_addr, &cfg.server_name);
+                let sni = if !cfg.server_name.is_empty() {
+                    cfg.server_name.as_str()
+                } else {
+                    "localhost"
+                };
+                quic_pool.start_client(endpoint, server_addr, sni);
                 quic_pool
             }
             "2" => {
@@ -312,10 +386,9 @@ impl TunnelClient {
                 let server_addr = self.dns_cache.resolve(&cfg.tunnel_addr).await?;
                 let ws_url = format!("ws://{}/", cfg.tunnel_addr);
                 let tls_connector = if cfg.tls_code != "0" {
-                    let tls_cfg = create_mode1_client_tls_config(Arc::clone(&recorded_fp));
+                    let (tls_cfg, domain_name) = make_client_tls_config(None);
                     let connector = TlsConnector::from(Arc::new(tls_cfg));
-                    let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap().to_owned();
-                    Some((connector, name))
+                    Some((connector, domain_name))
                 } else {
                     None
                 };
@@ -327,13 +400,12 @@ impl TunnelClient {
                 let h2_pool = Arc::new(H2Pool::new(cfg.max_pool_capacity));
                 let server_addr = self.dns_cache.resolve(&cfg.tunnel_addr).await?;
                 let tcp_stream = TcpStream::connect(server_addr).await?;
+                let _ = nodepass_transport::stream::configure_tcp_socket(&tcp_stream);
                 let h2_pool_clone = Arc::clone(&h2_pool);
                 let tls_connector = if cfg.tls_code != "0" {
-                    let mut tls_cfg = create_mode1_client_tls_config(Arc::clone(&recorded_fp));
-                    tls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+                    let (tls_cfg, domain_name) = make_client_tls_config(Some(vec![b"h2".to_vec()]));
                     let connector = TlsConnector::from(Arc::new(tls_cfg));
-                    let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap().to_owned();
-                    Some((connector, name))
+                    Some((connector, domain_name))
                 } else {
                     None
                 };
@@ -352,10 +424,9 @@ impl TunnelClient {
                 let pool_arc = Arc::new(tcp_pool);
                 let server_addr = self.dns_cache.resolve(&cfg.tunnel_addr).await?;
                 let tls_connector = if cfg.tls_code != "0" {
-                    let tls_cfg = create_mode1_client_tls_config(Arc::clone(&recorded_fp));
+                    let (tls_cfg, domain_name) = make_client_tls_config(None);
                     let connector = TlsConnector::from(Arc::new(tls_cfg));
-                    let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap().to_owned();
-                    Some((connector, name))
+                    Some((connector, domain_name))
                 } else {
                     None
                 };
@@ -388,6 +459,7 @@ impl TunnelClient {
                 if let Some(target) = cfg_clone.target_addrs.first() {
                     if let Ok(listener) = TcpListener::bind(target).await {
                         while let Ok((target_conn, remote_addr)) = listener.accept().await {
+                            let _ = nodepass_transport::stream::configure_tcp_socket(&target_conn);
                             if !is_verified_tcp.load(Ordering::SeqCst) {
                                 warn!("Dropping TCP connection: TLS Mode 1 not yet verified");
                                 drop(target_conn);
@@ -555,6 +627,7 @@ impl TunnelClient {
                                 if stats.try_acquire_slot(false) {
                                     if let Ok((_, target_addr)) = selector.select_next().await {
                                         if let Ok(mut target_conn) = TcpStream::connect(target_addr).await {
+                                            let _ = nodepass_transport::stream::configure_tcp_socket(&target_conn);
                                             if proxy_enabled {
                                                 if let Ok(client_addr) = remote_addr_str.parse::<SocketAddr>() {
                                                     let hdr = format_proxy_v1_header(client_addr, target_addr);
@@ -710,23 +783,44 @@ impl TunnelClient {
             }
         }
 
+        if !*shutdown_rx.borrow() && !self.is_stopped() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "tunnel control connection lost",
+            ));
+        }
+
         Ok(())
     }
 
     async fn perform_handshake(&self) -> io::Result<HandshakeResponse> {
-        let (tunnel_addr, server_name, tunnel_key) = {
+        let (tunnel_addr, server_name, tunnel_key, crt_path) = {
             let cfg = self.config.read();
-            (cfg.tunnel_addr.clone(), cfg.server_name.clone(), cfg.tunnel_key.clone())
+            (
+                cfg.tunnel_addr.clone(),
+                cfg.server_name.clone(),
+                cfg.tunnel_key.clone(),
+                cfg.crt_path.clone(),
+            )
         };
 
         let server_sock_addr = self.dns_cache.resolve(&tunnel_addr).await?;
         let tcp_stream = TcpStream::connect(server_sock_addr).await?;
+        let _ = nodepass_transport::stream::configure_tcp_socket(&tcp_stream);
 
-        // Ephemeral TLS client handshake (InsecureSkipVerify)
+        // Ephemeral TLS client handshake
         let recorded_fp = Arc::new(parking_lot::Mutex::new(None));
-        let tls_cfg = create_mode1_client_tls_config(recorded_fp);
+        let tls_cfg = create_mode2_client_tls_config(crt_path.as_deref())
+            .unwrap_or_else(|_| create_mode1_client_tls_config(recorded_fp));
         let connector = TlsConnector::from(Arc::new(tls_cfg));
-        let domain_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap().to_owned();
+        let sni_str = if !server_name.is_empty() {
+            server_name.clone()
+        } else {
+            "localhost".to_string()
+        };
+        let domain_name = rustls::pki_types::ServerName::try_from(sni_str)
+            .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap())
+            .to_owned();
         let mut tls_stream = connector.connect(domain_name, tcp_stream).await?;
 
         // HTTP GET / request
@@ -741,6 +835,13 @@ impl TunnelClient {
         tokio::io::AsyncReadExt::read_to_end(&mut tls_stream, &mut resp_bytes).await?;
 
         let resp_str = String::from_utf8_lossy(&resp_bytes);
+        if !resp_str.starts_with("HTTP/1.1 200") && !resp_str.starts_with("HTTP/1.0 200") {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("handshake failed: {}", resp_str.lines().next().unwrap_or("unknown error")),
+            ));
+        }
+
         // Find JSON body after \r\n\r\n
         if let Some(pos) = resp_str.find("\r\n\r\n") {
             let json_body = &resp_str[pos + 4..];

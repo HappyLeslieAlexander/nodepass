@@ -187,9 +187,8 @@ mod tests {
         let (c1, mut s1) = tokio::io::duplex(1024);
         let (c2, mut s2) = tokio::io::duplex(1024);
 
-        let handle = tokio::spawn(async move {
-            data_exchange(c1, c2, Duration::from_secs(5), 1024).await
-        });
+        let handle =
+            tokio::spawn(async move { data_exchange(c1, c2, Duration::from_secs(5), 1024).await });
 
         s1.write_all(b"hello with timeout").await.unwrap();
         let mut buf = [0u8; 18];
@@ -220,7 +219,8 @@ mod tests {
         let res = tokio::time::timeout(
             Duration::from_millis(500),
             data_exchange(c1, c2, Duration::from_millis(50), 1024),
-        ).await;
+        )
+        .await;
 
         assert!(res.is_ok(), "data_exchange did not complete within 500ms");
         let exchange_res = res.unwrap();

@@ -3,10 +3,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Writes a length-prefixed UDP datagram with a 2-byte big-endian header.
-pub async fn write_udp_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    data: &[u8],
-) -> io::Result<()> {
+pub async fn write_udp_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> io::Result<()> {
     if data.len() > 65535 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

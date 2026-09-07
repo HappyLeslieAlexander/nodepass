@@ -33,3 +33,4 @@ tempfile = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 url = { workspace = true }
+libc = { workspace = true }

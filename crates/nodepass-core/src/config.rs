@@ -51,7 +51,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 pub struct TunnelConfig {
     pub raw_url: String,
-    pub core_type: String, // "server", "client", "master"
+    pub core_type: String,   // "server", "client", "master"
     pub tunnel_addr: String, // e.g. "0.0.0.0:10101" or "example.com:10101"
     pub server_name: String, // TLS SNI or "none"
     pub server_port: u16,
@@ -86,7 +86,10 @@ impl TunnelConfig {
         let url = Url::parse(url_str).map_err(|e| ConfigError::InvalidUrl(e.to_string()))?;
         let core_type = url.scheme().to_lowercase();
         if core_type != "server" && core_type != "client" && core_type != "master" {
-            return Err(ConfigError::InvalidUrl(format!("unknown scheme: {}", core_type)));
+            return Err(ConfigError::InvalidUrl(format!(
+                "unknown scheme: {}",
+                core_type
+            )));
         }
 
         let host = url.host_str().ok_or(ConfigError::MissingTunnelAddr)?;
@@ -282,7 +285,10 @@ impl TunnelConfig {
 
     pub fn to_url_string(&self) -> String {
         let targets = self.target_addrs.join(",");
-        let mut s = format!("{}://{}@{}/{}", self.core_type, self.tunnel_key, self.tunnel_addr, targets);
+        let mut s = format!(
+            "{}://{}@{}/{}",
+            self.core_type, self.tunnel_key, self.tunnel_addr, targets
+        );
         let mut query = Vec::new();
 
         query.push(format!("dns={}", format_duration(self.dns_cache_ttl)));
@@ -333,9 +339,15 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     } else if let Some(stripped) = s.strip_suffix('s') {
         stripped.parse::<u64>().ok().map(Duration::from_secs)
     } else if let Some(stripped) = s.strip_suffix('m') {
-        stripped.parse::<u64>().ok().map(|m| Duration::from_secs(m * 60))
+        stripped
+            .parse::<u64>()
+            .ok()
+            .map(|m| Duration::from_secs(m * 60))
     } else if let Some(stripped) = s.strip_suffix('h') {
-        stripped.parse::<u64>().ok().map(|h| Duration::from_secs(h * 3600))
+        stripped
+            .parse::<u64>()
+            .ok()
+            .map(|h| Duration::from_secs(h * 3600))
     } else if let Ok(sec) = s.parse::<u64>() {
         Some(Duration::from_secs(sec))
     } else {
@@ -462,7 +474,8 @@ mod tests {
 
     #[test]
     fn test_parse_client_with_auth_and_targets() {
-        let url = "client://mypassword@server.com:10101/10.0.0.1:80,10.0.0.2:80?lbs=1&rate=50&block=12";
+        let url =
+            "client://mypassword@server.com:10101/10.0.0.1:80,10.0.0.2:80?lbs=1&rate=50&block=12";
         let cfg = TunnelConfig::parse(url).unwrap();
         assert_eq!(cfg.core_type, "client");
         assert_eq!(cfg.tunnel_key, "mypassword");

@@ -70,9 +70,10 @@ impl AsyncWrite for H2Stream {
                     Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
                 }
             }
-            Poll::Ready(None) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "stream closed")))
-            }
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream closed",
+            ))),
             Poll::Ready(Some(Err(e))) => {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
             }

@@ -85,9 +85,7 @@ where
                     Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
                 }
             }
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
             Poll::Pending => Poll::Pending,
         }
     }

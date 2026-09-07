@@ -37,7 +37,11 @@ impl StateManager {
                     inst.status = "stopped".to_string();
                     instances.insert(id, inst);
                 }
-                info!("Loaded {} instances from state file {:?}", instances.len(), self.path);
+                info!(
+                    "Loaded {} instances from state file {:?}",
+                    instances.len(),
+                    self.path
+                );
                 Ok(())
             }
             Err(e) => {

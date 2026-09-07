@@ -16,7 +16,10 @@ use tower::ServiceExt;
 fn create_test_app() -> (axum::Router, String) {
     let instances = Arc::new(DashMap::new());
     let (event_tx, _) = broadcast::channel(16);
-    let process_mgr = Arc::new(ProcessManager::new(Arc::clone(&instances), event_tx.clone()));
+    let process_mgr = Arc::new(ProcessManager::new(
+        Arc::clone(&instances),
+        event_tx.clone(),
+    ));
     let temp_file = NamedTempFile::new().unwrap();
     let state_mgr = Arc::new(StateManager::new(temp_file.path()));
 
@@ -45,11 +48,11 @@ fn create_test_app() -> (axum::Router, String) {
         prefix,
         version,
         mid: "test-mid".to_string(),
-        alias: "test-alias".to_string(),
+        alias: Arc::new(parking_lot::RwLock::new("test-alias".to_string())),
         hostname: "localhost".to_string(),
         start_time: Instant::now(),
-        log_level: None,
-        tls_code: None,
+        log_level: Some("debug".to_string()),
+        tls_code: Some("1".to_string()),
         crt_path: None,
         key_path: None,
     };
@@ -193,6 +196,51 @@ async fn test_rest_api_auth_and_crud() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    // 11. GET /info (verifying master metadata, log, and tls)
+    let req = Request::builder()
+        .uri("/api/v1/info")
+        .method("GET")
+        .header("X-API-Key", &api_key)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let info_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(info_json["alias"], "test-alias");
+    assert_eq!(info_json["log"], "debug");
+    assert_eq!(info_json["tls"], "1");
+
+    // 12. POST /info (updating master alias)
+    let update_info_body = json!({
+        "alias": "updated-master-alias"
+    });
+    let req = Request::builder()
+        .uri("/api/v1/info")
+        .method("POST")
+        .header("X-API-Key", &api_key)
+        .header("Content-Type", "application/json")
+        .body(Body::from(update_info_body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let updated_info_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(updated_info_json["alias"], "updated-master-alias");
+
+    // 13. Verify GET /info reflects the updated alias
+    let req = Request::builder()
+        .uri("/api/v1/info")
+        .method("GET")
+        .header("X-API-Key", &api_key)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let info_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(info_json["alias"], "updated-master-alias");
 }
 
 #[tokio::test]

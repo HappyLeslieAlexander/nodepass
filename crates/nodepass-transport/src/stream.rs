@@ -49,10 +49,7 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for SplitStream<R, W> {
         Pin::new(&mut self.writer).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.writer).poll_shutdown(cx)
     }
 }
@@ -87,4 +84,3 @@ pub fn is_transient_error(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::TimedOut
     )
 }
-

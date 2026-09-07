@@ -2,18 +2,14 @@ use crate::control::ControlLoop;
 use crate::exchange::data_exchange_with_stats;
 use crate::udp_session::UdpSessionManager;
 use nodepass_core::address::{DnsCache, TargetSelector};
-use nodepass_core::config::{
-    TunnelConfig, POOL_GET_TIMEOUT, REPORT_INTERVAL, UDP_READ_TIMEOUT,
-};
+use nodepass_core::config::{TunnelConfig, POOL_GET_TIMEOUT, REPORT_INTERVAL, UDP_READ_TIMEOUT};
 use nodepass_core::crypto::{
     constant_time_eq, format_cert_fingerprint, generate_ephemeral_cert, verify_auth_token,
     verify_pre_auth,
 };
 use nodepass_core::protocol::{detect_block_protocol, format_proxy_v1_header, Signal};
 use nodepass_transport::framed::{read_udp_frame, write_udp_frame};
-use nodepass_transport::pool::{
-    H2Pool, QuicPool, TcpPool, TransportPool, WsPool,
-};
+use nodepass_transport::pool::{H2Pool, QuicPool, TcpPool, TransportPool, WsPool};
 use nodepass_transport::rate::RateLimiter;
 use nodepass_transport::stats::Stats;
 use std::io;
@@ -35,6 +31,15 @@ pub struct TunnelServer {
     stop_flag: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+struct SessionGuard(Option<tokio::sync::watch::Sender<bool>>);
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(true);
+        }
+    }
 }
 
 impl TunnelServer {
@@ -79,7 +84,10 @@ impl TunnelServer {
                     break;
                 }
                 let cooldown = nodepass_core::config::service_cooldown();
-                warn!("Tunnel server error: {}. Restarting in {:?}...", e, cooldown);
+                warn!(
+                    "Tunnel server error: {}. Restarting in {:?}...",
+                    e, cooldown
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(cooldown) => {}
                     _ = shutdown_rx.changed() => {
@@ -93,7 +101,10 @@ impl TunnelServer {
                     break;
                 }
                 let cooldown = nodepass_core::config::service_cooldown();
-                warn!("Tunnel server finished unexpectedly. Restarting in {:?}...", cooldown);
+                warn!(
+                    "Tunnel server finished unexpectedly. Restarting in {:?}...",
+                    cooldown
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(cooldown) => {}
                     _ = shutdown_rx.changed() => {
@@ -109,10 +120,16 @@ impl TunnelServer {
 
     /// Single execution of server run mode.
     pub async fn start(&self) -> io::Result<()> {
+        let (session_tx, session_rx) = tokio::sync::watch::channel(false);
+        let _session_guard = SessionGuard(Some(session_tx));
+
         // 1. Determine run mode and flow direction
         let (initial_mode, target_to_test) = {
             let cfg = self.config.read();
-            (cfg.run_mode.clone(), cfg.target_addrs.first().cloned().unwrap_or_default())
+            (
+                cfg.run_mode.clone(),
+                cfg.target_addrs.first().cloned().unwrap_or_default(),
+            )
         };
 
         let (run_mode, data_flow) = match initial_mode.as_str() {
@@ -135,7 +152,7 @@ impl TunnelServer {
 
         // 2. Perform HTTP handshake
         info!("Pending tunnel handshake...");
-        let client_ip = self.perform_handshake().await?;
+        let client_ip = self.perform_handshake(session_rx.clone()).await?;
         debug!("Handshake completed with client IP: {}", client_ip);
 
         // 3. If TLS Mode 1 or Mode 2 is active, prepare certificate with TLS 1.3
@@ -165,8 +182,8 @@ impl TunnelServer {
                         (vec![c], k)
                     }
                 } else {
-                    let (cert, key) = generate_ephemeral_cert()
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let (cert, key) =
+                        generate_ephemeral_cert().map_err(|e| io::Error::other(e.to_string()))?;
                     (vec![cert], key)
                 };
 
@@ -208,8 +225,8 @@ impl TunnelServer {
                         (vec![c], k)
                     }
                 } else {
-                    let (cert, key) = generate_ephemeral_cert()
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let (cert, key) =
+                        generate_ephemeral_cert().map_err(|e| io::Error::other(e.to_string()))?;
                     (vec![cert], key)
                 };
                 let mut rustls_server_cfg = rustls::ServerConfig::builder()
@@ -239,25 +256,34 @@ impl TunnelServer {
                 let listener = TcpListener::bind(&cfg.tunnel_addr).await?;
                 let h2_pool_clone = Arc::clone(&h2_pool);
                 let tls_acc = tls_acceptor.clone();
-                let stop_flag = Arc::clone(&self.stop_flag);
+                let mut h2_shutdown_rx = session_rx.clone();
                 tokio::spawn(async move {
-                    while !stop_flag.load(Ordering::Acquire) {
-                        match listener.accept().await {
-                            Ok((tcp_stream, _)) => {
-                                let _ = nodepass_transport::stream::configure_tcp_socket(&tcp_stream);
-                                let h2_p = Arc::clone(&h2_pool_clone);
-                                if let Some(ref acc) = tls_acc {
-                                    if let Ok(tls_stream) = acc.accept(tcp_stream).await {
-                                        h2_p.start_server(tls_stream);
-                                        break;
+                    loop {
+                        tokio::select! {
+                            accept_res = listener.accept() => {
+                                match accept_res {
+                                    Ok((tcp_stream, _)) => {
+                                        let _ = nodepass_transport::stream::configure_tcp_socket(&tcp_stream);
+                                        let h2_p = Arc::clone(&h2_pool_clone);
+                                        if let Some(ref acc) = tls_acc {
+                                            if let Ok(tls_stream) = acc.accept(tcp_stream).await {
+                                                h2_p.start_server(tls_stream);
+                                                break;
+                                            }
+                                        } else {
+                                            h2_p.start_server(tcp_stream);
+                                            break;
+                                        }
                                     }
-                                } else {
-                                    h2_p.start_server(tcp_stream);
-                                    break;
+                                    Err(_) => {
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                    }
                                 }
                             }
-                            Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            _ = h2_shutdown_rx.changed() => {
+                                if *h2_shutdown_rx.borrow() {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -274,8 +300,15 @@ impl TunnelServer {
         };
 
         // 5. Claim control connection
-        let control_conn = pool.outgoing_get("00000000", POOL_GET_TIMEOUT).await
-            .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, format!("set control conn failed: {}", e)))?;
+        let control_conn = pool
+            .outgoing_get("00000000", POOL_GET_TIMEOUT)
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("set control conn failed: {}", e),
+                )
+            })?;
 
         info!("Marking tunnel handshake as complete");
 
@@ -288,7 +321,9 @@ impl TunnelServer {
         // If TLS code 1, send verify signal with new fingerprint
         if cfg.tls_code == "1" {
             if let Some(ref fp) = new_fingerprint {
-                let _ = control_loop.send_signal(Signal::verify("00000000", fp.clone())).await;
+                let _ = control_loop
+                    .send_signal(Signal::verify("00000000", fp.clone()))
+                    .await;
             }
         }
 
@@ -300,26 +335,36 @@ impl TunnelServer {
             let stats_clone = self.stats.clone();
             let rate_limiter_clone = self.rate_limiter.clone();
             let is_verified_tcp = Arc::clone(&is_verified);
-            let stop_flag_tcp = Arc::clone(&self.stop_flag);
+            let mut tcp_shutdown_rx = session_rx.clone();
 
             tokio::spawn(async move {
                 if let Some(target) = cfg_clone.target_addrs.first() {
                     if let Ok(listener) = TcpListener::bind(target).await {
-                        while !stop_flag_tcp.load(Ordering::Acquire) {
-                            let (target_conn, remote_addr) = match listener.accept().await {
-                                Ok(pair) => pair,
-                                Err(e) => {
-                                    if stop_flag_tcp.load(Ordering::Acquire) {
+                        loop {
+                            let (target_conn, remote_addr) = tokio::select! {
+                                res = listener.accept() => match res {
+                                    Ok(pair) => pair,
+                                    Err(e) => {
+                                        if *tcp_shutdown_rx.borrow() {
+                                            break;
+                                        }
+                                        warn!("Target listener transient accept error: {}. Backing off 50ms...", e);
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                        continue;
+                                    }
+                                },
+                                _ = tcp_shutdown_rx.changed() => {
+                                    if *tcp_shutdown_rx.borrow() {
                                         break;
                                     }
-                                    warn!("Target listener transient accept error: {}. Backing off 50ms...", e);
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
                                     continue;
                                 }
                             };
                             let _ = nodepass_transport::stream::configure_tcp_socket(&target_conn);
                             if !is_verified_tcp.load(Ordering::Acquire) {
-                                warn!("Dropping incoming TCP connection: TLS Mode 1 not yet verified");
+                                warn!(
+                                    "Dropping incoming TCP connection: TLS Mode 1 not yet verified"
+                                );
                                 drop(target_conn);
                                 continue;
                             }
@@ -336,7 +381,7 @@ impl TunnelServer {
                                     cfg_clone.block_socks,
                                     cfg_clone.block_http,
                                     cfg_clone.block_tls,
-                                    ) {
+                                ) {
                                     warn!("Blocked protocol {} from {}", proto, remote_addr);
                                     stats_clone.release_slot(false);
                                     continue;
@@ -350,8 +395,12 @@ impl TunnelServer {
                             let rate_limit = rate_limiter_clone.clone();
 
                             tokio::spawn(async move {
-                                if let Ok((id, pool_conn)) = pool.incoming_get(POOL_GET_TIMEOUT).await {
-                                    let _ = control_tx.send(Signal::tcp(remote_addr.to_string(), id)).await;
+                                if let Ok((id, pool_conn)) =
+                                    pool.incoming_get(POOL_GET_TIMEOUT).await
+                                {
+                                    let _ = control_tx
+                                        .send(Signal::tcp(remote_addr.to_string(), id))
+                                        .await;
                                     let _ = data_exchange_with_stats(
                                         target_conn,
                                         pool_conn,
@@ -360,7 +409,8 @@ impl TunnelServer {
                                         Some(stats.tcp_rx.clone()),
                                         Some(stats.tcp_tx.clone()),
                                         rate_limit,
-                                    ).await;
+                                    )
+                                    .await;
                                 }
                                 stats.release_slot(false);
                             });
@@ -376,6 +426,7 @@ impl TunnelServer {
                 let cfg_udp = cfg.clone();
                 let stats_udp = self.stats.clone();
                 let is_verified_udp = Arc::clone(&is_verified);
+                let mut udp_shutdown_rx = session_rx.clone();
 
                 tokio::spawn(async move {
                     if let Some(target) = cfg_udp.target_addrs.first() {
@@ -384,7 +435,22 @@ impl TunnelServer {
                             let sessions = UdpSessionManager::new();
 
                             let mut buf = [0u8; 65535];
-                            while let Ok((n, client_addr)) = udp_sock.recv_from(&mut buf).await {
+                            loop {
+                                let (n, client_addr) = tokio::select! {
+                                    res = udp_sock.recv_from(&mut buf) => match res {
+                                        Ok(pair) => pair,
+                                        Err(_) => {
+                                            tokio::time::sleep(Duration::from_millis(50)).await;
+                                            continue;
+                                        }
+                                    },
+                                    _ = udp_shutdown_rx.changed() => {
+                                        if *udp_shutdown_rx.borrow() {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                };
                                 if !is_verified_udp.load(Ordering::SeqCst) {
                                     continue;
                                 }
@@ -395,9 +461,14 @@ impl TunnelServer {
                                     if !stats_udp.try_acquire_slot(true) {
                                         continue;
                                     }
-                                    if let Ok((id, pool_conn)) = pool_udp.incoming_get(POOL_GET_TIMEOUT).await {
-                                        let _ = control_tx_udp.send(Signal::udp(client_addr.to_string(), id)).await;
-                                        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                                    if let Ok((id, pool_conn)) =
+                                        pool_udp.incoming_get(POOL_GET_TIMEOUT).await
+                                    {
+                                        let _ = control_tx_udp
+                                            .send(Signal::udp(client_addr.to_string(), id))
+                                            .await;
+                                        let (tx, mut rx) =
+                                            tokio::sync::mpsc::channel::<Vec<u8>>(256);
                                         sessions.insert(client_addr, tx.clone());
 
                                         stats_udp.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
@@ -409,15 +480,22 @@ impl TunnelServer {
                                         let stats_reader = stats_clone.clone();
 
                                         tokio::spawn(async move {
-                                            let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
-                                            let last_active = Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+                                            let (mut r_stream, mut w_stream) =
+                                                tokio::io::split(pool_conn);
+                                            let last_active = Arc::new(parking_lot::Mutex::new(
+                                                std::time::Instant::now(),
+                                            ));
                                             let last_active_writer = Arc::clone(&last_active);
                                             let last_active_reader = Arc::clone(&last_active);
 
                                             let writer_task = async move {
                                                 while let Some(data) = rx.recv().await {
-                                                    *last_active_writer.lock() = std::time::Instant::now();
-                                                    if write_udp_frame(&mut w_stream, &data).await.is_err() {
+                                                    *last_active_writer.lock() =
+                                                        std::time::Instant::now();
+                                                    if write_udp_frame(&mut w_stream, &data)
+                                                        .await
+                                                        .is_err()
+                                                    {
                                                         break;
                                                     }
                                                 }
@@ -426,15 +504,35 @@ impl TunnelServer {
                                             let reader_task = async move {
                                                 let mut resp_buf = [0u8; 65535];
                                                 loop {
-                                                    match read_udp_frame(&mut r_stream, &mut resp_buf, UDP_READ_TIMEOUT).await {
+                                                    match read_udp_frame(
+                                                        &mut r_stream,
+                                                        &mut resp_buf,
+                                                        UDP_READ_TIMEOUT,
+                                                    )
+                                                    .await
+                                                    {
                                                         Ok(m) if m > 0 => {
-                                                            *last_active_reader.lock() = std::time::Instant::now();
-                                                            stats_reader.udp_tx.fetch_add(m as u64, Ordering::Relaxed);
-                                                            let _ = udp_sock_clone.send_to(&resp_buf[..m], client_addr).await;
+                                                            *last_active_reader.lock() =
+                                                                std::time::Instant::now();
+                                                            stats_reader.udp_tx.fetch_add(
+                                                                m as u64,
+                                                                Ordering::Relaxed,
+                                                            );
+                                                            let _ = udp_sock_clone
+                                                                .send_to(
+                                                                    &resp_buf[..m],
+                                                                    client_addr,
+                                                                )
+                                                                .await;
                                                         }
                                                         Ok(_) => break,
-                                                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                                                            if last_active_reader.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                        Err(e)
+                                                            if e.kind()
+                                                                == std::io::ErrorKind::TimedOut =>
+                                                        {
+                                                            if last_active_reader.lock().elapsed()
+                                                                >= UDP_READ_TIMEOUT
+                                                            {
                                                                 break;
                                                             }
                                                         }
@@ -502,15 +600,28 @@ impl TunnelServer {
                         let remote_addr_str = signal.remote_addr.unwrap_or_default();
 
                         tokio::spawn(async move {
-                            if let Ok(pool_conn) = pool_clone.outgoing_get(&id, POOL_GET_TIMEOUT).await {
+                            if let Ok(pool_conn) =
+                                pool_clone.outgoing_get(&id, POOL_GET_TIMEOUT).await
+                            {
                                 if stats.try_acquire_slot(false) {
                                     if let Ok((_, target_addr)) = selector.select_next().await {
-                                        if let Ok(mut target_conn) = TcpStream::connect(target_addr).await {
-                                            let _ = nodepass_transport::stream::configure_tcp_socket(&target_conn);
+                                        if let Ok(mut target_conn) =
+                                            TcpStream::connect(target_addr).await
+                                        {
+                                            let _ =
+                                                nodepass_transport::stream::configure_tcp_socket(
+                                                    &target_conn,
+                                                );
                                             if proxy_enabled {
-                                                if let Ok(client_addr) = remote_addr_str.parse::<SocketAddr>() {
-                                                    let hdr = format_proxy_v1_header(client_addr, target_addr);
-                                                    let _ = target_conn.write_all(hdr.as_bytes()).await;
+                                                if let Ok(client_addr) =
+                                                    remote_addr_str.parse::<SocketAddr>()
+                                                {
+                                                    let hdr = format_proxy_v1_header(
+                                                        client_addr,
+                                                        target_addr,
+                                                    );
+                                                    let _ =
+                                                        target_conn.write_all(hdr.as_bytes()).await;
                                                 }
                                             }
 
@@ -522,7 +633,8 @@ impl TunnelServer {
                                                 Some(stats.tcp_rx.clone()),
                                                 Some(stats.tcp_tx.clone()),
                                                 rate_limiter,
-                                            ).await;
+                                            )
+                                            .await;
                                         }
                                     }
                                     stats.release_slot(false);
@@ -543,17 +655,24 @@ impl TunnelServer {
                         let stats = stats.clone();
 
                         tokio::spawn(async move {
-                            if let Ok(pool_conn) = pool_clone.outgoing_get(&id, POOL_GET_TIMEOUT).await {
+                            if let Ok(pool_conn) =
+                                pool_clone.outgoing_get(&id, POOL_GET_TIMEOUT).await
+                            {
                                 if stats.try_acquire_slot(true) {
                                     if let Ok((_, target_addr)) = selector.select_next().await {
-                                        if let Ok(target_sock) = UdpSocket::bind("0.0.0.0:0").await {
+                                        if let Ok(target_sock) = UdpSocket::bind("0.0.0.0:0").await
+                                        {
                                             if target_sock.connect(target_addr).await.is_ok() {
                                                 let target_sock = Arc::new(target_sock);
                                                 let target_sock_read = Arc::clone(&target_sock);
                                                 let stats_t = stats.clone();
 
-                                                let (mut r_stream, mut w_stream) = tokio::io::split(pool_conn);
-                                                let last_active = Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+                                                let (mut r_stream, mut w_stream) =
+                                                    tokio::io::split(pool_conn);
+                                                let last_active =
+                                                    Arc::new(parking_lot::Mutex::new(
+                                                        std::time::Instant::now(),
+                                                    ));
                                                 let last_active_task1 = Arc::clone(&last_active);
                                                 let last_active_task2 = Arc::clone(&last_active);
 
@@ -580,18 +699,37 @@ impl TunnelServer {
                                                 let task2 = async move {
                                                     let mut buf = [0u8; 65535];
                                                     loop {
-                                                        match tokio::time::timeout(UDP_READ_TIMEOUT, target_sock_read.recv(&mut buf)).await {
+                                                        match tokio::time::timeout(
+                                                            UDP_READ_TIMEOUT,
+                                                            target_sock_read.recv(&mut buf),
+                                                        )
+                                                        .await
+                                                        {
                                                             Ok(Ok(n)) if n > 0 => {
-                                                                *last_active_task2.lock() = std::time::Instant::now();
-                                                                stats_t.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
-                                                                if write_udp_frame(&mut w_stream, &buf[..n]).await.is_err() {
+                                                                *last_active_task2.lock() =
+                                                                    std::time::Instant::now();
+                                                                stats_t.udp_tx.fetch_add(
+                                                                    n as u64,
+                                                                    Ordering::Relaxed,
+                                                                );
+                                                                if write_udp_frame(
+                                                                    &mut w_stream,
+                                                                    &buf[..n],
+                                                                )
+                                                                .await
+                                                                .is_err()
+                                                                {
                                                                     break;
                                                                 }
                                                             }
                                                             Ok(Ok(_)) => break,
                                                             Ok(Err(_)) => break,
                                                             Err(_) => {
-                                                                if last_active_task2.lock().elapsed() >= UDP_READ_TIMEOUT {
+                                                                if last_active_task2
+                                                                    .lock()
+                                                                    .elapsed()
+                                                                    >= UDP_READ_TIMEOUT
+                                                                {
                                                                     break;
                                                                 }
                                                             }
@@ -616,7 +754,12 @@ impl TunnelServer {
                     let _ = control_loop.send_signal(Signal::pong()).await;
                 }
                 "pong" => {
-                    let rtt = control_loop.last_ping_time().lock().await.elapsed().as_millis();
+                    let rtt = control_loop
+                        .last_ping_time()
+                        .lock()
+                        .await
+                        .elapsed()
+                        .as_millis();
                     let (tcprx, tcptx, udprx, udptx, tcps, udps) = stats.snapshot();
                     info!(
                         "CHECK_POINT|MODE={}|PING={}ms|POOL={}|TCPS={}|UDPS={}|TCPRX={}|TCPTX={}|UDPRX={}|UDPTX={}",
@@ -631,20 +774,32 @@ impl TunnelServer {
                                 Some(expected_fp) => {
                                     if !constant_time_eq(fp.as_bytes(), expected_fp.as_bytes()) {
                                         warn!("TLS code-1: fingerprint mismatch: expected {} but got {}", expected_fp, fp);
-                                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "TLS fingerprint mismatch"));
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::PermissionDenied,
+                                            "TLS fingerprint mismatch",
+                                        ));
                                     }
                                     is_verified.store(true, Ordering::SeqCst);
-                                    info!("TLS code-1: RAM cert verified with sha256 fingerprint: {}", fp);
+                                    info!(
+                                        "TLS code-1: RAM cert verified with sha256 fingerprint: {}",
+                                        fp
+                                    );
                                 }
                                 None => {
                                     warn!("TLS code-1: verify signal received but no server certificate was configured");
-                                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "No TLS server certificate"));
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::PermissionDenied,
+                                        "No TLS server certificate",
+                                    ));
                                 }
                             }
                         }
                         None => {
                             warn!("TLS code-1: verify signal missing fingerprint");
-                            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Missing TLS fingerprint in verify signal"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "Missing TLS fingerprint in verify signal",
+                            ));
                         }
                     }
                 }
@@ -667,7 +822,10 @@ impl TunnelServer {
         Ok(())
     }
 
-    async fn perform_handshake(&self) -> io::Result<String> {
+    async fn perform_handshake(
+        &self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> io::Result<String> {
         let (tunnel_addr, tunnel_key, data_flow, max_cap, tls_code, pool_type) = {
             let cfg = self.config.read();
             (
@@ -680,10 +838,12 @@ impl TunnelServer {
             )
         };
 
-        let (cert, key) = generate_ephemeral_cert()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let (cert, key) = generate_ephemeral_cert().map_err(|e| io::Error::other(e.to_string()))?;
         let fp = format_cert_fingerprint(&cert);
-        info!("TLS code-1: RAM cert prepared with sha256 fingerprint: {}", fp);
+        info!(
+            "TLS code-1: RAM cert prepared with sha256 fingerprint: {}",
+            fp
+        );
 
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -693,80 +853,142 @@ impl TunnelServer {
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let listener = TcpListener::bind(&tunnel_addr).await?;
 
-        // Accept single handshake HTTP request
-        let (tcp_stream, client_addr) = listener.accept().await?;
-        let mut tls_stream = acceptor.accept(tcp_stream).await?;
+        loop {
+            let (tcp_stream, client_addr) = tokio::select! {
+                res = listener.accept() => match res {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        if nodepass_transport::stream::is_transient_error(&e) {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                },
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "handshake cancelled"));
+                    }
+                    continue;
+                }
+            };
 
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-        const MAX_HEADER_SIZE: usize = 65536;
-        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            if buf.len() >= MAX_HEADER_SIZE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "HTTP handshake headers exceeded 64KB limit"));
-            }
-            let n = tls_stream.read(&mut chunk).await?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "HTTP handshake connection closed prematurely"));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        let req_str = String::from_utf8_lossy(&buf);
+            let _ = nodepass_transport::stream::configure_tcp_socket(&tcp_stream);
 
-        // Handle CONNECT method pre-auth
-        if req_str.starts_with("CONNECT ") {
+            let mut tls_stream = match acceptor.accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Handshake: probe from {} failed TLS: {}", client_addr, e);
+                    continue;
+                }
+            };
+
+            let read_res = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                const MAX_HEADER_SIZE: usize = 65536;
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    if buf.len() >= MAX_HEADER_SIZE {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HTTP handshake headers exceeded 64KB limit",
+                        ));
+                    }
+                    let n = tls_stream.read(&mut chunk).await?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "HTTP handshake connection closed prematurely",
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Ok::<_, io::Error>((buf, tls_stream))
+            })
+            .await;
+
+            let (buf, mut tls_stream) = match read_res {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    debug!("Handshake: read error from {}: {}", client_addr, e);
+                    continue;
+                }
+                Err(_) => {
+                    debug!("Handshake: read timeout from {}", client_addr);
+                    continue;
+                }
+            };
+
+            let req_str = String::from_utf8_lossy(&buf);
+
+            // Handle CONNECT method pre-auth
+            if req_str.starts_with("CONNECT ") {
+                let authorized = req_str.lines().any(|line| {
+                    if line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization: ")
+                    {
+                        verify_pre_auth(line[21..].trim(), &tunnel_key)
+                    } else {
+                        false
+                    }
+                });
+
+                if !authorized {
+                    let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Restricted\"\r\nConnection: close\r\n\r\n";
+                    let _ = tls_stream.write_all(resp.as_bytes()).await;
+                    let _ = tls_stream.shutdown().await;
+                    continue;
+                }
+
+                let resp = "HTTP/1.1 200 Connection established\r\n\r\n";
+                let _ = tls_stream.write_all(resp.as_bytes()).await;
+                return Ok(client_addr.ip().to_string());
+            }
+
+            // Validate Authorization header
             let authorized = req_str.lines().any(|line| {
-                if line.to_ascii_lowercase().starts_with("proxy-authorization: ") {
-                    verify_pre_auth(line[21..].trim(), &tunnel_key)
+                if line
+                    .to_ascii_lowercase()
+                    .starts_with("authorization: bearer ")
+                {
+                    let token = line[21..].trim();
+                    verify_auth_token(token, &tunnel_key)
                 } else {
                     false
                 }
             });
 
             if !authorized {
-                let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Restricted\"\r\nConnection: close\r\n\r\n";
+                let resp = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n";
                 let _ = tls_stream.write_all(resp.as_bytes()).await;
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unauthorized CONNECT pre-auth"));
+                let _ = tls_stream.shutdown().await;
+                debug!(
+                    "Handshake: unauthorized handshake attempt from {}",
+                    client_addr
+                );
+                continue;
             }
 
-            let resp = "HTTP/1.1 200 Connection established\r\n\r\n";
+            info!(
+                "Sending tunnel config: FLOW={}|MAX={}|TLS={}|TYPE={}",
+                data_flow, max_cap, tls_code, pool_type
+            );
+
+            let json_body = format!(
+                "{{\"flow\":\"{}\",\"max\":{},\"tls\":\"{}\",\"type\":\"{}\"}}\n",
+                data_flow, max_cap, tls_code, pool_type
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json_body.len(),
+                json_body
+            );
             tls_stream.write_all(resp.as_bytes()).await?;
-            return Ok(client_addr.ip().to_string());
+            let _ = tls_stream.shutdown().await;
+
+            let client_ip = client_addr.ip().to_string();
+            return Ok(client_ip);
         }
-
-        // Validate Authorization header
-        let authorized = req_str.lines().any(|line| {
-            if line.to_ascii_lowercase().starts_with("authorization: bearer ") {
-                let token = line[21..].trim();
-                verify_auth_token(token, &tunnel_key)
-            } else {
-                false
-            }
-        });
-
-        if !authorized {
-            let resp = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n";
-            let _ = tls_stream.write_all(resp.as_bytes()).await;
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unauthorized handshake"));
-        }
-
-        info!(
-            "Sending tunnel config: FLOW={}|MAX={}|TLS={}|TYPE={}",
-            data_flow, max_cap, tls_code, pool_type
-        );
-
-        let json_body = format!(
-            "{{\"flow\":\"{}\",\"max\":{},\"tls\":\"{}\",\"type\":\"{}\"}}\n",
-            data_flow, max_cap, tls_code, pool_type
-        );
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            json_body.len(),
-            json_body
-        );
-        tls_stream.write_all(resp.as_bytes()).await?;
-        let _ = tls_stream.shutdown().await;
-
-        let client_ip = client_addr.ip().to_string();
-        Ok(client_ip)
     }
 }

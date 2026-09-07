@@ -76,10 +76,12 @@ impl Stats {
         if is_udp {
             let mut curr = self.udp_slot.load(Ordering::Relaxed);
             while curr > 0 {
-                match self
-                    .udp_slot
-                    .compare_exchange_weak(curr, curr - 1, Ordering::SeqCst, Ordering::Relaxed)
-                {
+                match self.udp_slot.compare_exchange_weak(
+                    curr,
+                    curr - 1,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
                     Err(actual) => curr = actual,
                 }
@@ -87,10 +89,12 @@ impl Stats {
         } else {
             let mut curr = self.tcp_slot.load(Ordering::Relaxed);
             while curr > 0 {
-                match self
-                    .tcp_slot
-                    .compare_exchange_weak(curr, curr - 1, Ordering::SeqCst, Ordering::Relaxed)
-                {
+                match self.tcp_slot.compare_exchange_weak(
+                    curr,
+                    curr - 1,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
                     Err(actual) => curr = actual,
                 }
@@ -119,7 +123,7 @@ mod tests {
     fn test_slot_acquisition_and_release() {
         let stats = Stats::new(2);
         assert!(stats.try_acquire_slot(false)); // TCP slot 1
-        assert!(stats.try_acquire_slot(true));  // UDP slot 1, total 2
+        assert!(stats.try_acquire_slot(true)); // UDP slot 1, total 2
         assert!(!stats.try_acquire_slot(false)); // Limit reached!
         assert!(!stats.try_acquire_slot(true));
 

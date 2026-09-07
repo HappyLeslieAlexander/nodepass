@@ -149,7 +149,10 @@ mod tests {
     fn test_signal_json_serialization() {
         let sig = Signal::tcp("1.2.3.4:5678", "01020304");
         let json = serde_json::to_string(&sig).unwrap();
-        assert_eq!(json, r#"{"action":"tcp","remote":"1.2.3.4:5678","id":"01020304"}"#);
+        assert_eq!(
+            json,
+            r#"{"action":"tcp","remote":"1.2.3.4:5678","id":"01020304"}"#
+        );
 
         let decoded: Signal = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, sig);
@@ -160,7 +163,10 @@ mod tests {
 
         let verify = Signal::verify("00000000", "abcdef123456");
         let verify_json = serde_json::to_string(&verify).unwrap();
-        assert_eq!(verify_json, r#"{"action":"verify","id":"00000000","fp":"abcdef123456"}"#);
+        assert_eq!(
+            verify_json,
+            r#"{"action":"verify","id":"00000000","fp":"abcdef123456"}"#
+        );
     }
 
     #[test]

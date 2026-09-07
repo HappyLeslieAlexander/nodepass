@@ -76,8 +76,14 @@ mod tests {
         client_pool.start_client(client_io, 4);
 
         // Claim control connection
-        let mut server_ctrl = server_pool.outgoing_get("00000000", Duration::from_secs(3)).await.unwrap();
-        let mut client_ctrl = client_pool.outgoing_get("00000000", Duration::from_secs(3)).await.unwrap();
+        let mut server_ctrl = server_pool
+            .outgoing_get("00000000", Duration::from_secs(3))
+            .await
+            .unwrap();
+        let mut client_ctrl = client_pool
+            .outgoing_get("00000000", Duration::from_secs(3))
+            .await
+            .unwrap();
 
         client_ctrl.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
@@ -88,9 +94,15 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Data stream roundtrip
-        let (id, mut server_stream) = server_pool.incoming_get(Duration::from_secs(3)).await.unwrap();
+        let (id, mut server_stream) = server_pool
+            .incoming_get(Duration::from_secs(3))
+            .await
+            .unwrap();
         assert!(!id.is_empty());
-        let mut client_stream = client_pool.outgoing_get(&id, Duration::from_secs(3)).await.unwrap();
+        let mut client_stream = client_pool
+            .outgoing_get(&id, Duration::from_secs(3))
+            .await
+            .unwrap();
 
         server_stream.write_all(b"hello h2 stream").await.unwrap();
         let mut buf2 = [0u8; 15];
@@ -111,8 +123,14 @@ mod tests {
         client_pool.start_client(addr, ws_url, 2, None);
 
         // Claim control connection
-        let mut server_ctrl = server_pool.outgoing_get("00000000", Duration::from_secs(3)).await.unwrap();
-        let mut client_ctrl = client_pool.outgoing_get("00000000", Duration::from_secs(3)).await.unwrap();
+        let mut server_ctrl = server_pool
+            .outgoing_get("00000000", Duration::from_secs(3))
+            .await
+            .unwrap();
+        let mut client_ctrl = client_pool
+            .outgoing_get("00000000", Duration::from_secs(3))
+            .await
+            .unwrap();
 
         client_ctrl.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
@@ -134,7 +152,8 @@ mod tests {
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server_cfg).unwrap(),
         ));
-        let server_endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
 
         let server_pool = QuicPool::new(16);
@@ -158,7 +177,9 @@ mod tests {
         let (server_ctrl_res, client_ctrl_res) = tokio::join!(
             server_pool.outgoing_get("00000000", Duration::from_secs(3)),
             async {
-                let mut c = client_pool.outgoing_get("00000000", Duration::from_secs(3)).await?;
+                let mut c = client_pool
+                    .outgoing_get("00000000", Duration::from_secs(3))
+                    .await?;
                 c.write_all(b"quic").await?;
                 Ok::<_, PoolError>(c)
             }
@@ -172,11 +193,17 @@ mod tests {
         assert_eq!(&buf, b"quic");
 
         // Open and exchange on data stream
-        let (id, mut server_stream) = server_pool.incoming_get(Duration::from_secs(3)).await.unwrap();
+        let (id, mut server_stream) = server_pool
+            .incoming_get(Duration::from_secs(3))
+            .await
+            .unwrap();
         assert!(!id.is_empty());
 
         server_stream.write_all(b"hello quic data").await.unwrap();
-        let mut client_stream = client_pool.outgoing_get(&id, Duration::from_secs(3)).await.unwrap();
+        let mut client_stream = client_pool
+            .outgoing_get(&id, Duration::from_secs(3))
+            .await
+            .unwrap();
 
         let mut buf2 = [0u8; 15];
         client_stream.read_exact(&mut buf2).await.unwrap();

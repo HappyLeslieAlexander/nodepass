@@ -89,7 +89,12 @@ impl QuicPool {
     }
 
     /// Starts QUIC pool client connecting to tunnel_addr via Quinn Endpoint.
-    pub fn start_client(&self, endpoint: quinn::Endpoint, server_addr: SocketAddr, server_name: &str) {
+    pub fn start_client(
+        &self,
+        endpoint: quinn::Endpoint,
+        server_addr: SocketAddr,
+        server_name: &str,
+    ) {
         let control_stream = Arc::clone(&self.control_stream);
         let control_notify = Arc::clone(&self.control_notify);
         let quic_conn = Arc::clone(&self.quic_conn);
@@ -124,7 +129,8 @@ impl QuicPool {
                                             match conn_clone.accept_bi().await {
                                                 Ok((send, recv)) => {
                                                     active_count.fetch_add(1, Ordering::Relaxed);
-                                                    let boxed = box_stream(QuinnStream::new(send, recv));
+                                                    let boxed =
+                                                        box_stream(QuinnStream::new(send, recv));
                                                     if stream_tx.send(boxed).await.is_err() {
                                                         break;
                                                     }

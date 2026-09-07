@@ -62,10 +62,12 @@ impl WsPool {
                         tokio::spawn(async move {
                             let ws_stream = if let Some(ref acceptor) = tls_opt {
                                 match acceptor.accept(tcp_stream).await {
-                                    Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
-                                        Ok(ws) => box_stream(WsStream::new(ws)),
-                                        Err(_) => return,
-                                    },
+                                    Ok(tls_stream) => {
+                                        match tokio_tungstenite::accept_async(tls_stream).await {
+                                            Ok(ws) => box_stream(WsStream::new(ws)),
+                                            Err(_) => return,
+                                        }
+                                    }
                                     Err(_) => return,
                                 }
                             } else {
@@ -119,18 +121,20 @@ impl WsPool {
             while !stop_flag.load(Ordering::Acquire) {
                 if let Ok(tcp_stream) = TcpStream::connect(tunnel_addr).await {
                     let _ = crate::stream::configure_tcp_socket(&tcp_stream);
-                    let boxed_tcp: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
-                        match connector.connect(name.clone(), tcp_stream).await {
-                            Ok(tls_stream) => box_stream(tls_stream),
-                            Err(_) => {
-                                ctrl_interval = (ctrl_interval + Duration::from_millis(100)).min(max_interval);
-                                tokio::time::sleep(ctrl_interval).await;
-                                continue;
+                    let boxed_tcp: BoxedStream =
+                        if let Some((ref connector, ref name)) = tls_connector {
+                            match connector.connect(name.clone(), tcp_stream).await {
+                                Ok(tls_stream) => box_stream(tls_stream),
+                                Err(_) => {
+                                    ctrl_interval = (ctrl_interval + Duration::from_millis(100))
+                                        .min(max_interval);
+                                    tokio::time::sleep(ctrl_interval).await;
+                                    continue;
+                                }
                             }
-                        }
-                    } else {
-                        box_stream(tcp_stream)
-                    };
+                        } else {
+                            box_stream(tcp_stream)
+                        };
 
                     if let Ok((ws, _)) = tokio_tungstenite::client_async(&ws_url, boxed_tcp).await {
                         *control_stream.lock().await = Some(box_stream(WsStream::new(ws)));
@@ -151,18 +155,20 @@ impl WsPool {
                     match TcpStream::connect(tunnel_addr).await {
                         Ok(tcp_stream) => {
                             let _ = crate::stream::configure_tcp_socket(&tcp_stream);
-                            let boxed_tcp: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
-                                match connector.connect(name.clone(), tcp_stream).await {
-                                    Ok(tls_stream) => box_stream(tls_stream),
-                                    Err(_) => {
-                                        interval = (interval + Duration::from_millis(100)).min(max_interval);
-                                        tokio::time::sleep(interval).await;
-                                        continue;
+                            let boxed_tcp: BoxedStream =
+                                if let Some((ref connector, ref name)) = tls_connector {
+                                    match connector.connect(name.clone(), tcp_stream).await {
+                                        Ok(tls_stream) => box_stream(tls_stream),
+                                        Err(_) => {
+                                            interval = (interval + Duration::from_millis(100))
+                                                .min(max_interval);
+                                            tokio::time::sleep(interval).await;
+                                            continue;
+                                        }
                                     }
-                                }
-                            } else {
-                                box_stream(tcp_stream)
-                            };
+                                } else {
+                                    box_stream(tcp_stream)
+                                };
 
                             match tokio_tungstenite::client_async(&ws_url, boxed_tcp).await {
                                 Ok((ws, _)) => {
@@ -173,7 +179,8 @@ impl WsPool {
                                     }
                                 }
                                 Err(_) => {
-                                    interval = (interval + Duration::from_millis(100)).min(max_interval);
+                                    interval =
+                                        (interval + Duration::from_millis(100)).min(max_interval);
                                 }
                             }
                         }

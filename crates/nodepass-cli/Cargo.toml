@@ -25,3 +25,4 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
+parking_lot = { workspace = true }

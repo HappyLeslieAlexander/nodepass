@@ -39,11 +39,7 @@ impl TcpPool {
     }
 
     /// Spawns background worker for server mode accepting TCP connections.
-    pub fn start_server(
-        &self,
-        listener: TcpListener,
-        tls_acceptor: Option<TlsAcceptor>,
-    ) {
+    pub fn start_server(&self, listener: TcpListener, tls_acceptor: Option<TlsAcceptor>) {
         let control_stream = Arc::clone(&self.control_stream);
         let control_notify = Arc::clone(&self.control_notify);
         let idle_tx = self.idle_tx.clone();
@@ -107,11 +103,13 @@ impl TcpPool {
             while !stop_flag.load(Ordering::Acquire) {
                 if let Ok(stream) = TcpStream::connect(tunnel_addr).await {
                     let _ = crate::stream::configure_tcp_socket(&stream);
-                    let boxed: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
+                    let boxed: BoxedStream = if let Some((ref connector, ref name)) = tls_connector
+                    {
                         match connector.connect(name.clone(), stream).await {
                             Ok(tls_stream) => box_stream(tls_stream),
                             Err(_) => {
-                                ctrl_interval = (ctrl_interval + Duration::from_millis(100)).min(max_interval);
+                                ctrl_interval =
+                                    (ctrl_interval + Duration::from_millis(100)).min(max_interval);
                                 tokio::time::sleep(ctrl_interval).await;
                                 continue;
                             }
@@ -137,18 +135,20 @@ impl TcpPool {
                     match TcpStream::connect(tunnel_addr).await {
                         Ok(stream) => {
                             let _ = crate::stream::configure_tcp_socket(&stream);
-                            let boxed: BoxedStream = if let Some((ref connector, ref name)) = tls_connector {
-                                match connector.connect(name.clone(), stream).await {
-                                    Ok(tls_stream) => box_stream(tls_stream),
-                                    Err(_) => {
-                                        interval = (interval + Duration::from_millis(100)).min(max_interval);
-                                        tokio::time::sleep(interval).await;
-                                        continue;
+                            let boxed: BoxedStream =
+                                if let Some((ref connector, ref name)) = tls_connector {
+                                    match connector.connect(name.clone(), stream).await {
+                                        Ok(tls_stream) => box_stream(tls_stream),
+                                        Err(_) => {
+                                            interval = (interval + Duration::from_millis(100))
+                                                .min(max_interval);
+                                            tokio::time::sleep(interval).await;
+                                            continue;
+                                        }
                                     }
-                                }
-                            } else {
-                                box_stream(stream)
-                            };
+                                } else {
+                                    box_stream(stream)
+                                };
 
                             active_count.fetch_add(1, Ordering::Release);
                             interval = min_interval; // reset interval on successful addition

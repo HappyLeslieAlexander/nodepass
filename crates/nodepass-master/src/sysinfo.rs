@@ -146,8 +146,25 @@ pub fn parse_linux_diskstats(content: &str, info: &mut SystemInfo) {
             {
                 continue;
             }
-            // Skip partition devices ending with a digit (e.g. sda1, nvme0n1p1)
-            if dev_name.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            // Skip partition devices:
+            // For nvme and mmcblk devices, partitions end with 'p' followed by digits (e.g. nvme0n1p1, mmcblk0p1).
+            // For standard disks (sda, vda, xvda, etc.), partitions end directly with digits (e.g. sda1).
+            let is_partition = if dev_name.starts_with("nvme") || dev_name.starts_with("mmcblk") {
+                if let Some(pos) = dev_name.rfind('p') {
+                    pos > 0
+                        && dev_name[pos + 1..].chars().all(|c| c.is_ascii_digit())
+                        && !dev_name[pos + 1..].is_empty()
+                } else {
+                    false
+                }
+            } else {
+                dev_name
+                    .chars()
+                    .last()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+            };
+            if is_partition {
                 continue;
             }
             if let Ok(r_sectors) = fields[5].parse::<u64>() {
@@ -242,10 +259,10 @@ mod tests {
         assert_eq!(info.netrx, 50000000);
         assert_eq!(info.nettx, 20000000);
 
-        // Diskstats
-        let diskstats_str = "   8       0 sda 1000 0 80000 100 2000 0 160000 200 0 300 300 0 0 0 0\n   8       1 sda1 1000 0 80000 100 2000 0 160000 200 0 300 300 0 0 0 0\n";
+        // Diskstats (including sda, sda1 partition, nvme0n1, and nvme0n1p1 partition)
+        let diskstats_str = "   8       0 sda 1000 0 80000 100 2000 0 160000 200 0 300 300 0 0 0 0\n   8       1 sda1 1000 0 80000 100 2000 0 160000 200 0 300 300 0 0 0 0\n 259       0 nvme0n1 1000 0 20000 100 2000 0 40000 200 0 300 300 0 0 0 0\n 259       1 nvme0n1p1 1000 0 20000 100 2000 0 40000 200 0 300 300 0 0 0 0\n";
         parse_linux_diskstats(diskstats_str, &mut info);
-        assert_eq!(info.diskr, 80000 * 512);
-        assert_eq!(info.diskw, 160000 * 512);
+        assert_eq!(info.diskr, (80000 + 20000) * 512);
+        assert_eq!(info.diskw, (160000 + 40000) * 512);
     }
 }

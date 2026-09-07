@@ -237,10 +237,7 @@ mod tests {
     #[tokio::test]
     async fn test_target_selector_round_robin() {
         let cache = DnsCache::new(Duration::from_secs(60));
-        let targets = vec![
-            "127.0.0.1:8081".to_string(),
-            "127.0.0.1:8082".to_string(),
-        ];
+        let targets = vec!["127.0.0.1:8081".to_string(), "127.0.0.1:8082".to_string()];
         let selector = TargetSelector::new(targets, "0", cache, Duration::from_secs(300));
 
         let (t1, a1) = selector.select_next().await.unwrap();

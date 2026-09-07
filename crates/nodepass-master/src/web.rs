@@ -31,7 +31,7 @@ pub struct AppState {
     pub prefix: String,
     pub version: String,
     pub mid: String,
-    pub alias: String,
+    pub alias: Arc<parking_lot::RwLock<String>>,
     pub hostname: String,
     pub start_time: Instant,
     pub log_level: Option<String>,
@@ -50,10 +50,16 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         // OpenAPI spec & Swagger UI (Public)
-        .route(&format!("{}/openapi.json", prefix), get(handle_openapi_spec))
+        .route(
+            &format!("{}/openapi.json", prefix),
+            get(handle_openapi_spec),
+        )
         .route(&format!("{}/docs", prefix), get(handle_swagger_docs))
         // REST endpoints (Protected)
-        .route(&format!("{}/instances", prefix), get(handle_list_instances).post(handle_create_instance))
+        .route(
+            &format!("{}/instances", prefix),
+            get(handle_list_instances).post(handle_create_instance),
+        )
         .route(
             &format!("{}/instances/:id", prefix),
             get(handle_get_instance)
@@ -61,29 +67,48 @@ pub fn create_router(state: AppState) -> Router {
                 .put(handle_put_instance)
                 .delete(handle_delete_instance),
         )
-        .route(&format!("{}/instances/:id/:action", prefix), post(handle_control_instance))
+        .route(
+            &format!("{}/instances/:id/:action", prefix),
+            post(handle_control_instance),
+        )
         .route(&format!("{}/events", prefix), get(handle_sse_events))
-        .route(&format!("{}/info", prefix), get(handle_info))
+        .route(
+            &format!("{}/info", prefix),
+            get(handle_info).post(handle_update_info),
+        )
         .route(&format!("{}/tcping", prefix), get(handle_tcping))
         // MCP endpoint (POST /mcp or POST /api/mcp)
         .route("/mcp", post(handle_mcp))
-        .route(&format!("{}/mcp", prefix.trim_end_matches("/v1")), post(handle_mcp))
+        .route(
+            &format!("{}/mcp", prefix.trim_end_matches("/v1")),
+            post(handle_mcp),
+        )
         .layer(cors)
         .with_state(state)
 }
 
 fn check_auth(headers: &HeaderMap, expected_key: &str) -> bool {
-    if let Some(val) = headers.get("X-API-Key").or_else(|| headers.get("x-api-key")) {
+    if let Some(val) = headers
+        .get("X-API-Key")
+        .or_else(|| headers.get("x-api-key"))
+    {
         if let Ok(str_val) = val.to_str() {
-            if nodepass_core::crypto::constant_time_eq(str_val.as_bytes(), expected_key.as_bytes()) {
+            if nodepass_core::crypto::constant_time_eq(str_val.as_bytes(), expected_key.as_bytes())
+            {
                 return true;
             }
         }
     }
     if let Some(val) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(str_val) = val.to_str() {
-            if let Some(token) = str_val.strip_prefix("Bearer ").or_else(|| str_val.strip_prefix("bearer ")) {
-                if nodepass_core::crypto::constant_time_eq(token.trim().as_bytes(), expected_key.as_bytes()) {
+            if let Some(token) = str_val
+                .strip_prefix("Bearer ")
+                .or_else(|| str_val.strip_prefix("bearer "))
+            {
+                if nodepass_core::crypto::constant_time_eq(
+                    token.trim().as_bytes(),
+                    expected_key.as_bytes(),
+                ) {
                     return true;
                 }
             }
@@ -134,9 +159,8 @@ pub fn enhance_url(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    let has_key = |pairs: &[(String, String)], key: &str| -> bool {
-        pairs.iter().any(|(k, _)| k == key)
-    };
+    let has_key =
+        |pairs: &[(String, String)], key: &str| -> bool { pairs.iter().any(|(k, _)| k == key) };
 
     if let Some(log) = log_level {
         if !log.is_empty() && !has_key(&query_pairs, "log") {
@@ -198,9 +222,8 @@ pub fn generate_config_url(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    let has_key = |pairs: &[(String, String)], key: &str| -> bool {
-        pairs.iter().any(|(k, _)| k == key)
-    };
+    let has_key =
+        |pairs: &[(String, String)], key: &str| -> bool { pairs.iter().any(|(k, _)| k == key) };
 
     if let Some(log) = log_level {
         if !log.is_empty() && !has_key(&query_pairs, "log") {
@@ -230,34 +253,86 @@ pub fn generate_config_url(
 
     match instance_type {
         "client" => {
-            if !has_key(&query_pairs, "dns") { query_pairs.push(("dns".to_string(), "5m0s".to_string())); }
-            if !has_key(&query_pairs, "sni") { query_pairs.push(("sni".to_string(), "none".to_string())); }
-            if !has_key(&query_pairs, "lbs") { query_pairs.push(("lbs".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "min") { query_pairs.push(("min".to_string(), "64".to_string())); }
-            if !has_key(&query_pairs, "mode") { query_pairs.push(("mode".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "type") { query_pairs.push(("type".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "dial") { query_pairs.push(("dial".to_string(), "auto".to_string())); }
-            if !has_key(&query_pairs, "read") { query_pairs.push(("read".to_string(), "0s".to_string())); }
-            if !has_key(&query_pairs, "rate") { query_pairs.push(("rate".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "slot") { query_pairs.push(("slot".to_string(), "65536".to_string())); }
-            if !has_key(&query_pairs, "proxy") { query_pairs.push(("proxy".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "block") { query_pairs.push(("block".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "notcp") { query_pairs.push(("notcp".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "noudp") { query_pairs.push(("noudp".to_string(), "0".to_string())); }
+            if !has_key(&query_pairs, "dns") {
+                query_pairs.push(("dns".to_string(), "5m0s".to_string()));
+            }
+            if !has_key(&query_pairs, "sni") {
+                query_pairs.push(("sni".to_string(), "none".to_string()));
+            }
+            if !has_key(&query_pairs, "lbs") {
+                query_pairs.push(("lbs".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "min") {
+                query_pairs.push(("min".to_string(), "64".to_string()));
+            }
+            if !has_key(&query_pairs, "mode") {
+                query_pairs.push(("mode".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "type") {
+                query_pairs.push(("type".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "dial") {
+                query_pairs.push(("dial".to_string(), "auto".to_string()));
+            }
+            if !has_key(&query_pairs, "read") {
+                query_pairs.push(("read".to_string(), "0s".to_string()));
+            }
+            if !has_key(&query_pairs, "rate") {
+                query_pairs.push(("rate".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "slot") {
+                query_pairs.push(("slot".to_string(), "65536".to_string()));
+            }
+            if !has_key(&query_pairs, "proxy") {
+                query_pairs.push(("proxy".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "block") {
+                query_pairs.push(("block".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "notcp") {
+                query_pairs.push(("notcp".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "noudp") {
+                query_pairs.push(("noudp".to_string(), "0".to_string()));
+            }
         }
         "server" => {
-            if !has_key(&query_pairs, "dns") { query_pairs.push(("dns".to_string(), "5m0s".to_string())); }
-            if !has_key(&query_pairs, "lbs") { query_pairs.push(("lbs".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "max") { query_pairs.push(("max".to_string(), "1024".to_string())); }
-            if !has_key(&query_pairs, "mode") { query_pairs.push(("mode".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "dial") { query_pairs.push(("dial".to_string(), "auto".to_string())); }
-            if !has_key(&query_pairs, "read") { query_pairs.push(("read".to_string(), "0s".to_string())); }
-            if !has_key(&query_pairs, "rate") { query_pairs.push(("rate".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "slot") { query_pairs.push(("slot".to_string(), "65536".to_string())); }
-            if !has_key(&query_pairs, "proxy") { query_pairs.push(("proxy".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "block") { query_pairs.push(("block".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "notcp") { query_pairs.push(("notcp".to_string(), "0".to_string())); }
-            if !has_key(&query_pairs, "noudp") { query_pairs.push(("noudp".to_string(), "0".to_string())); }
+            if !has_key(&query_pairs, "dns") {
+                query_pairs.push(("dns".to_string(), "5m0s".to_string()));
+            }
+            if !has_key(&query_pairs, "lbs") {
+                query_pairs.push(("lbs".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "max") {
+                query_pairs.push(("max".to_string(), "1024".to_string()));
+            }
+            if !has_key(&query_pairs, "mode") {
+                query_pairs.push(("mode".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "dial") {
+                query_pairs.push(("dial".to_string(), "auto".to_string()));
+            }
+            if !has_key(&query_pairs, "read") {
+                query_pairs.push(("read".to_string(), "0s".to_string()));
+            }
+            if !has_key(&query_pairs, "rate") {
+                query_pairs.push(("rate".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "slot") {
+                query_pairs.push(("slot".to_string(), "65536".to_string()));
+            }
+            if !has_key(&query_pairs, "proxy") {
+                query_pairs.push(("proxy".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "block") {
+                query_pairs.push(("block".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "notcp") {
+                query_pairs.push(("notcp".to_string(), "0".to_string()));
+            }
+            if !has_key(&query_pairs, "noudp") {
+                query_pairs.push(("noudp".to_string(), "0".to_string()));
+            }
         }
         _ => {}
     }
@@ -651,15 +726,58 @@ async fn handle_info(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    let current_alias = state.alias.read().clone();
     let info = get_master_info(
         &state.mid,
-        &state.alias,
+        &current_alias,
         &state.version,
         &state.hostname,
-        "info",
-        "0",
-        "",
-        "",
+        state.log_level.as_deref().unwrap_or("info"),
+        state.tls_code.as_deref().unwrap_or("0"),
+        state.crt_path.as_deref().unwrap_or(""),
+        state.key_path.as_deref().unwrap_or(""),
+        state.start_time,
+    );
+
+    Ok(Json(info))
+}
+
+#[derive(Deserialize)]
+struct UpdateInfoReq {
+    alias: String,
+}
+
+async fn handle_update_info(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateInfoReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_auth(&headers, &state.api_key) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    if payload.alias.len() > 256 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    *state.alias.write() = payload.alias.clone();
+
+    if let Some(mut api_key) = state.instances.get_mut(crate::types::API_KEY_ID) {
+        api_key.alias = payload.alias.clone();
+        drop(api_key);
+        let _ = state.state_mgr.save(&state.instances).await;
+    }
+
+    let current_alias = state.alias.read().clone();
+    let info = get_master_info(
+        &state.mid,
+        &current_alias,
+        &state.version,
+        &state.hostname,
+        state.log_level.as_deref().unwrap_or("info"),
+        state.tls_code.as_deref().unwrap_or("0"),
+        state.crt_path.as_deref().unwrap_or(""),
+        state.key_path.as_deref().unwrap_or(""),
         state.start_time,
     );
 
@@ -676,13 +794,26 @@ pub fn check_tcping_target(target: &str) -> Result<(), String> {
         for addr in addrs {
             match addr.ip() {
                 std::net::IpAddr::V4(ipv4) => {
-                    if ipv4.is_link_local() || ipv4.is_broadcast() || ipv4.is_unspecified() || ipv4.is_loopback() {
-                        return Err("Access to loopback, link-local, or prohibited IP is blocked".to_string());
+                    if ipv4.is_link_local()
+                        || ipv4.is_broadcast()
+                        || ipv4.is_unspecified()
+                        || ipv4.is_loopback()
+                    {
+                        return Err(
+                            "Access to loopback, link-local, or prohibited IP is blocked"
+                                .to_string(),
+                        );
                     }
                 }
                 std::net::IpAddr::V6(ipv6) => {
-                    if ipv6.is_unspecified() || ipv6.is_loopback() || ((ipv6.segments()[0] & 0xffc0) == 0xfe80) {
-                        return Err("Access to loopback, link-local, or prohibited IP is blocked".to_string());
+                    if ipv6.is_unspecified()
+                        || ipv6.is_loopback()
+                        || ((ipv6.segments()[0] & 0xffc0) == 0xfe80)
+                    {
+                        return Err(
+                            "Access to loopback, link-local, or prohibited IP is blocked"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -710,7 +841,9 @@ async fn handle_tcping(
     }
 
     let start = Instant::now();
-    let res = match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&query.target)).await {
+    let res = match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&query.target))
+        .await
+    {
         Ok(Ok(_)) => TCPingResult {
             target: query.target,
             connected: true,
@@ -764,22 +897,21 @@ mod tests {
         );
         assert!(enhanced.contains("log=debug"));
         assert!(enhanced.contains("tls=2"));
-        assert!(enhanced.contains("crt=%2Fpath%2Fto%2Fcert.pem") || enhanced.contains("crt=/path/to/cert.pem"));
-        assert!(enhanced.contains("key=%2Fpath%2Fto%2Fkey.pem") || enhanced.contains("key=/path/to/key.pem"));
+        assert!(
+            enhanced.contains("crt=%2Fpath%2Fto%2Fcert.pem")
+                || enhanced.contains("crt=/path/to/cert.pem")
+        );
+        assert!(
+            enhanced.contains("key=%2Fpath%2Fto%2Fkey.pem")
+                || enhanced.contains("key=/path/to/key.pem")
+        );
         assert!(enhanced.contains("type=0"));
     }
 
     #[test]
     fn test_generate_config_url_client_defaults() {
         let raw = "client://:password@127.0.0.1:8080/127.0.0.1:80";
-        let config_url = generate_config_url(
-            raw,
-            "client",
-            Some("info"),
-            Some("0"),
-            None,
-            None,
-        );
+        let config_url = generate_config_url(raw, "client", Some("info"), Some("0"), None, None);
         assert!(config_url.contains("dns=5m0s"));
         assert!(config_url.contains("sni=none"));
         assert!(config_url.contains("lbs=0"));
@@ -793,14 +925,7 @@ mod tests {
     #[test]
     fn test_generate_config_url_server_defaults() {
         let raw = "server://:password@127.0.0.1:8080/127.0.0.1:80";
-        let config_url = generate_config_url(
-            raw,
-            "server",
-            None,
-            Some("0"),
-            None,
-            None,
-        );
+        let config_url = generate_config_url(raw, "server", None, Some("0"), None, None);
         assert!(config_url.contains("dns=5m0s"));
         assert!(config_url.contains("lbs=0"));
         assert!(config_url.contains("max=1024"));

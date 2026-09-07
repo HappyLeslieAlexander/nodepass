@@ -222,7 +222,12 @@ impl MCPResponse {
         }
     }
 
-    pub fn error(id: Option<serde_json::Value>, code: i32, message: impl Into<String>, data: Option<serde_json::Value>) -> Self {
+    pub fn error(
+        id: Option<serde_json::Value>,
+        code: i32,
+        message: impl Into<String>,
+        data: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,

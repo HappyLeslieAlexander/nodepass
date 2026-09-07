@@ -101,10 +101,16 @@ impl ProcessManager {
                     let mut line_buf = Vec::new();
                     loop {
                         line_buf.clear();
-                        match (&mut reader).take(MAX_LOG_LINE_LEN as u64).read_until(b'\n', &mut line_buf).await {
+                        match (&mut reader)
+                            .take(MAX_LOG_LINE_LEN as u64)
+                            .read_until(b'\n', &mut line_buf)
+                            .await
+                        {
                             Ok(0) => break,
                             Ok(_) => {
-                                let line = String::from_utf8_lossy(&line_buf).trim_end_matches(&['\r', '\n'][..]).to_string();
+                                let line = String::from_utf8_lossy(&line_buf)
+                                    .trim_end_matches(&['\r', '\n'][..])
+                                    .to_string();
                                 Self::process_log_line(
                                     &id_for_stdout,
                                     &line,
@@ -130,10 +136,16 @@ impl ProcessManager {
                     let mut line_buf = Vec::new();
                     loop {
                         line_buf.clear();
-                        match (&mut reader).take(MAX_LOG_LINE_LEN as u64).read_until(b'\n', &mut line_buf).await {
+                        match (&mut reader)
+                            .take(MAX_LOG_LINE_LEN as u64)
+                            .read_until(b'\n', &mut line_buf)
+                            .await
+                        {
                             Ok(0) => break,
                             Ok(_) => {
-                                let line = String::from_utf8_lossy(&line_buf).trim_end_matches(&['\r', '\n'][..]).to_string();
+                                let line = String::from_utf8_lossy(&line_buf)
+                                    .trim_end_matches(&['\r', '\n'][..])
+                                    .to_string();
                                 Self::process_log_line(
                                     &id_for_stderr,
                                     &line,
@@ -150,8 +162,26 @@ impl ProcessManager {
 
             tokio::select! {
                 _ = &mut stop_rx => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    #[cfg(unix)]
+                    {
+                        if let Some(pid) = child.id() {
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGTERM);
+                            }
+                        }
+                        tokio::select! {
+                            _ = child.wait() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                    }
                 }
                 status = child.wait() => {
                     debug!("Instance {} child exited: {:?}", instance_id, status);
@@ -202,7 +232,11 @@ impl ProcessManager {
     }
 
     pub async fn stop_all(&self) {
-        let ids: Vec<String> = self.running_processes.iter().map(|e| e.key().clone()).collect();
+        let ids: Vec<String> = self
+            .running_processes
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
         for id in ids {
             self.stop_instance(&id).await;
         }
@@ -233,11 +267,21 @@ impl ProcessManager {
         let clean_line = Self::strip_ansi(line);
         if let Some(caps) = re.captures(&clean_line) {
             if let Some(mut inst) = instances.get_mut(instance_id) {
-                if let Ok(v) = caps[1].parse::<i32>() { inst.mode = v; }
-                if let Ok(v) = caps[2].parse::<i32>() { inst.ping = v; }
-                if let Ok(v) = caps[3].parse::<i32>() { inst.pool = v; }
-                if let Ok(v) = caps[4].parse::<i32>() { inst.tcps = v; }
-                if let Ok(v) = caps[5].parse::<i32>() { inst.udps = v; }
+                if let Ok(v) = caps[1].parse::<i32>() {
+                    inst.mode = v;
+                }
+                if let Ok(v) = caps[2].parse::<i32>() {
+                    inst.ping = v;
+                }
+                if let Ok(v) = caps[3].parse::<i32>() {
+                    inst.pool = v;
+                }
+                if let Ok(v) = caps[4].parse::<i32>() {
+                    inst.tcps = v;
+                }
+                if let Ok(v) = caps[5].parse::<i32>() {
+                    inst.udps = v;
+                }
 
                 if let Ok(raw_tcprx) = caps[6].parse::<u64>() {
                     inst.tcprx = inst.tcp_rx_base + raw_tcprx.saturating_sub(inst.tcp_rx_reset);
@@ -322,11 +366,22 @@ mod tests {
         let (event_tx, _) = broadcast::channel(16);
         let pm = ProcessManager::new(Arc::clone(&instances), event_tx.clone());
 
-        let mut inst = Instance::new("inst-1".to_string(), "test".to_string(), "client".to_string(), "client://".to_string());
+        let mut inst = Instance::new(
+            "inst-1".to_string(),
+            "test".to_string(),
+            "client".to_string(),
+            "client://".to_string(),
+        );
         inst.status = "running".to_string();
         instances.insert("inst-1".to_string(), inst);
 
-        ProcessManager::process_log_line("inst-1", raw_line, &instances, &event_tx, &pm.checkpoint_regex);
+        ProcessManager::process_log_line(
+            "inst-1",
+            raw_line,
+            &instances,
+            &event_tx,
+            &pm.checkpoint_regex,
+        );
 
         let updated = instances.get("inst-1").unwrap();
         assert_eq!(updated.mode, 2);
@@ -340,4 +395,3 @@ mod tests {
         assert_eq!(updated.udptx, 256);
     }
 }
-

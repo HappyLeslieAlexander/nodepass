@@ -142,7 +142,9 @@ async fn wait_for_shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut stream) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             stream.recv().await;
         } else {
             std::future::pending::<()>().await;
@@ -191,7 +193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Client(c)) => {
             init_logger(&c.log);
-            let addr = c.tunnel_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());
+            let addr = c
+                .tunnel_addr
+                .unwrap_or_else(|| "127.0.0.1:8080".to_string());
             let target = c.target_addr.unwrap_or_else(|| "127.0.0.1:80".to_string());
             let pwd = c.password.unwrap_or_default();
             let url_str = build_tunnel_url(
@@ -210,7 +214,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Master(m)) => {
             init_logger(&m.log);
-            run_master(&m.listen, m.api_key.as_deref(), &m.prefix, Some(m.log), None, None, None).await
+            run_master(
+                &m.listen,
+                m.api_key.as_deref(),
+                &m.prefix,
+                Some(m.log),
+                None,
+                None,
+                None,
+            )
+            .await
         }
         None => {
             if !cli.raw_args.is_empty() && cli.raw_args[0].contains("://") {
@@ -275,9 +288,17 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "master" => {
-            let listen = format!("{}:{}", parsed_url.host_str().unwrap_or("127.0.0.1"), parsed_url.port().unwrap_or(8080));
+            let listen = format!(
+                "{}:{}",
+                parsed_url.host_str().unwrap_or("127.0.0.1"),
+                parsed_url.port().unwrap_or(8080)
+            );
             let prefix = parsed_url.path();
-            let prefix = if prefix.is_empty() || prefix == "/" { "/api/v1" } else { prefix };
+            let prefix = if prefix.is_empty() || prefix == "/" {
+                "/api/v1"
+            } else {
+                prefix
+            };
             let key = if let Some(pass) = parsed_url.password() {
                 if !pass.is_empty() {
                     Some(pass)
@@ -304,7 +325,10 @@ async fn run_url(url_str: &str) -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
             }
-            run_master(&listen, key, prefix, log_level, tls_code, crt_path, key_path).await?;
+            run_master(
+                &listen, key, prefix, log_level, tls_code, crt_path, key_path,
+            )
+            .await?;
         }
         _ => {
             return Err(format!("Unknown scheme: {}", parsed_url.scheme()).into());
@@ -326,7 +350,10 @@ async fn run_master(
     let bind_addr: SocketAddr = listen_addr.parse()?;
     let instances = Arc::new(DashMap::new());
     let (event_tx, _) = tokio::sync::broadcast::channel(1024);
-    let process_mgr = Arc::new(ProcessManager::new(Arc::clone(&instances), event_tx.clone()));
+    let process_mgr = Arc::new(ProcessManager::new(
+        Arc::clone(&instances),
+        event_tx.clone(),
+    ));
     let state_mgr = Arc::new(StateManager::new("nodepass.json"));
     let _ = state_mgr.load(&instances);
 
@@ -358,7 +385,7 @@ async fn run_master(
         prefix: prefix.to_string(),
         version: VERSION.to_string(),
         mid: "master-1".to_string(),
-        alias: "nodepass-master".to_string(),
+        alias: Arc::new(parking_lot::RwLock::new("nodepass-master".to_string())),
         hostname: "localhost".to_string(),
         start_time: Instant::now(),
         log_level,
@@ -399,7 +426,8 @@ mod tests {
             "127.0.0.1:80",
             "my@pass?mode=1#target",
             &[("tls", "0"), ("mode", "2")],
-        ).expect("build tunnel url");
+        )
+        .expect("build tunnel url");
 
         assert!(url_str.starts_with("server://"));
         assert!(url_str.contains("my%40pass%3Fmode%3D1%23target@127.0.0.1:8080/127.0.0.1:80"));
@@ -449,7 +477,13 @@ mod tests {
     fn test_master_url_credential_extraction() {
         let u1 = Url::parse("master://mysecret@127.0.0.1:8080/api/v1").unwrap();
         let key1 = if let Some(pass) = u1.password() {
-            if !pass.is_empty() { Some(pass) } else if !u1.username().is_empty() { Some(u1.username()) } else { None }
+            if !pass.is_empty() {
+                Some(pass)
+            } else if !u1.username().is_empty() {
+                Some(u1.username())
+            } else {
+                None
+            }
         } else if !u1.username().is_empty() {
             Some(u1.username())
         } else {
@@ -459,7 +493,13 @@ mod tests {
 
         let u2 = Url::parse("master://:anothersecret@127.0.0.1:8080/api/v1").unwrap();
         let key2 = if let Some(pass) = u2.password() {
-            if !pass.is_empty() { Some(pass) } else if !u2.username().is_empty() { Some(u2.username()) } else { None }
+            if !pass.is_empty() {
+                Some(pass)
+            } else if !u2.username().is_empty() {
+                Some(u2.username())
+            } else {
+                None
+            }
         } else if !u2.username().is_empty() {
             Some(u2.username())
         } else {
